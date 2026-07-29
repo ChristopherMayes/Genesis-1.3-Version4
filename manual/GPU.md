@@ -133,11 +133,11 @@ loop.
 
 | `ngrid` | REGS x LANES | radices used | time for the SASE example |
 |---:|---:|---|---:|
-| 64 | 8 x 8 | 8, 8 | 6.69 s |
-| 128 | 16 x 8 | 16, 8 | 6.79 s |
-| 256 | 16 x 16 | 16, 16 | 7.55 s |
-| 512 | 32 x 16 | 32, 16 | 10.8 s |
-| 1024 | 32 x 32 | 32, 32 | 23.2 s |
+| 64 | 8 x 8 | 8, 8 | 6.60 s |
+| 128 | 16 x 8 | 16, 8 | 6.75 s |
+| 256 | 16 x 16 | 16, 16 | 7.45 s |
+| 512 | 32 x 16 | 32, 16 | 11.0 s |
+| 1024 | 32 x 32 | 32, 32 | 23.5 s |
 
 Agreement with the CPU degrades gently with grid size, because the transform is
 single precision and a larger grid means more rounding steps in each butterfly
