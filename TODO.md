@@ -1,18 +1,30 @@
 # TODO
 
-## 1. The two upstream pull requests
+## 1. The three upstream pull requests
 
-Both are open **as drafts** against `svenreiche/Genesis-1.3-Version4`, ready for you to edit and
+All are open **as drafts** against `svenreiche/Genesis-1.3-Version4`, ready for you to edit and
 then mark ready for review. Take #272 out of draft first — #273's body references it, because
-the three-FFT branch it touches is unreachable without the filter fix.
+the three-FFT branch it touches is unreachable without the filter fix. #274 is independent of
+both and can go at any time.
 
 | PR | branch | commit | title |
 |---|---|---|---|
 | [#272](https://github.com/svenreiche/Genesis-1.3-Version4/pull/272) | `fix/source-filter-noop` | `4fe13fe` | Fix `source_filter` being silently ignored in `FieldSolverFFT` |
 | [#273](https://github.com/svenreiche/Genesis-1.3-Version4/pull/273) | `perf/fft-two-pass` | `e101b30` | `FieldSolverFFT`: drop the source-term FFT when the source filter is off |
+| [#274](https://github.com/svenreiche/Genesis-1.3-Version4/pull/274) | `perf/user-diagnostic-guard` | `b815d7a` | Skip the user diagnostic's per-particle work when its output is disabled |
 
 The bodies as submitted are `PR-1-source-filter-fix.md` and `PR-2-fft-two-pass.md`. Edit them on
 GitHub, not here — these files are only the record of what was sent.
+
+### Possible fourth report: `transient` in `&wake` appears to do nothing
+
+`Collective::update` computes `icut`, the catch-up cut for the transient wake, in step 3, but
+the loop in step 4 starts at `i = 0` and never reads it. Only the commented-out older loop
+below it used `icut`. Measured on a 500-slice deck: `transient = true` costs 2.6x the runtime,
+because the convolution is redone every step, and produces a result identical to
+`transient = false` to 1.6e-16 in `Beam/energy` and exactly zero in `Beam/wakefield`.
+This needs confirming against Sven's intent before reporting, since fixing it would change
+results for anyone currently setting the flag.
 
 | other branch | commit | state |
 |---|---|---|
@@ -56,7 +68,14 @@ Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize
 - [x] Generalise `ngrid` beyond 256. The shader is now specialised per grid size through
       preprocessor macros and supports every power of two from 64 to 1024; anything else is a
       hard error naming the nearest supported size.
-- [ ] Port `Incoherent`, `Collective`/wakefields and short-range space charge (hard error today)
+- [x] Wakefields (`&wake`), including the resistive wall. A wake is driven by the slice
+      current rather than by individual particles, so the loss is one number per slice. The
+      host keeps the `MPI_Allgather` and the convolution, exactly as on the CPU path, and the
+      GPU adds the per-slice kick. Residency is preserved because slice currents do not change
+      during a run. Costs under 3% with `transient = false`. GPU vs CPU at 4 ranks:
+      `Beam/energy` 4.0e-10, `Beam/bunching` 3.5e-04, `Field/power` 1.7e-04, against a wake
+      effect of 4.0e-05, 8.5e-03 and 2.8e-03 respectively.
+- [ ] Port `Incoherent` and short-range space charge (hard error today)
 - [ ] Chicanes and correctors fall back to the CPU for that step — port `applyR56`
 - [ ] `one4one` is refused outright (the GPU wants a rectangular particle array)
 - [x] Host-side diagnostic assembly. It was ~5 s of the 7.4 s single-rank time. Most of it was

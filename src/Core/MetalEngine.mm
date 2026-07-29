@@ -625,6 +625,20 @@ kernel void push_beam(device float* G  [[buffer(0)]], device float* TH [[buffer(
 
     G[gid] = dg; TH[gid] = th;
 }
+
+// Wakefield energy loss. The wake is a single number per slice, because it is
+// driven by the slice current rather than by individual particles, so every
+// particle in a slice takes the same kick. The profile is built on the host,
+// where the current of every slice is available through an MPI gather; all that
+// is left here is the addition. G holds gamma as an offset from a reference
+// energy, and the kick is a difference, so it applies unchanged to the offset.
+kernel void apply_eloss(device float* G [[buffer(0)]],
+                        const device float* DG [[buffer(1)]],
+                        constant uint& npart [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]])
+{
+    G[gid] += DG[gid/npart];
+}
 )MSL";
 
 // Mirrors the MSL structs above.
@@ -693,6 +707,7 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bSrc {nil};
     id<MTLBuffer> bW {nil};
     id<MTLBuffer> bEZ {nil};
+    id<MTLBuffer> bELoss {nil};
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
@@ -701,7 +716,7 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bFM {nil};
 
     id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA, pTrk, pPush;
-    id<MTLComputePipelineState> pBM, pFM, pCopy;
+    id<MTLComputePipelineState> pBM, pFM, pCopy, pELoss;
 
     size_t bytes {0};
 
@@ -915,6 +930,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->bSrc = alloc(static_cast<size_t>(p_->nslice) * nn * 2 * sizeof(float));
     p_->bW = alloc(static_cast<size_t>(ng) * 2 * sizeof(float));
     p_->bEZ = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
+    p_->bELoss = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
     p_->bExpK.clear();
     p_->delzCached.assign(field->size(), -1.0);
     for (size_t i = 0; i < field->size(); i++) {
@@ -981,6 +997,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pBM = pso(@"beam_moments");
     p_->pFM = pso(@"field_moments");
     p_->pCopy = pso(@"copy_field");
+    p_->pELoss = pso(@"apply_eloss");
     if (!ok) {
         reason = "compute pipeline creation failed";
         return false;
@@ -1222,6 +1239,21 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
                          : 0.0f;
         }
 
+        // Wakefields. The loss profile is one number per slice and is built on
+        // the host, which is where the current of every slice is reachable
+        // through an MPI gather; the GPU only has to add it to the particles.
+        // Beam::track applies this after the longitudinal push, so the dispatch
+        // below sits between the push and the second transverse half step.
+        const bool haveWake = beam->computeWakeLoss(und);
+        if (haveWake) {
+            float *el = (float *)[p_->bELoss contents];
+            for (int is = 0; is < ns; is++) {
+                el[is] = (is < static_cast<int>(beam->eloss.size()))
+                             ? static_cast<float>(beam->eloss[is] * delz / 511000.0)
+                             : 0.0f;
+            }
+        }
+
         id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
 
@@ -1254,6 +1286,15 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e setBuffer:p_->bField[k] offset:0 atIndex:8 + i];
         }
         [e dispatchThreads:grid threadsPerThreadgroup:tg];
+
+        if (haveWake) {
+            const uint32_t np = static_cast<uint32_t>(p_->npart);
+            [e setComputePipelineState:p_->pELoss];
+            [e setBuffer:p_->bG offset:0 atIndex:0];
+            [e setBuffer:p_->bELoss offset:0 atIndex:1];
+            [e setBytes:&np length:sizeof(np) atIndex:2];
+            [e dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
 
         encTrack();   // second half step
 

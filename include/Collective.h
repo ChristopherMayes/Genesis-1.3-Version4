@@ -26,6 +26,7 @@ public:
    //   void initWake(unsigned int, double, double *, double *, double *, double, double, bool);
    void initWake(unsigned int, unsigned int, double, double *, double *, double *, double *, double, double, bool);
    void clearWake();
+   bool computeLoss(Beam *, Undulator *);
    void apply(Beam *,Undulator *, double );
    void update(Beam *, double);
    void forceUpdate();

@@ -112,12 +112,20 @@ void Beam::track(double delz,vector<Field *> *field, Undulator *und){
   solver.track(delz*0.5,this,und,true);      }
 
 
+// Computes the per-slice wakefield loss into 'eloss' without advancing the
+// particles, for backends that hold the particles somewhere other than the host
+// arrays. Returns false if no wake is defined.
+bool Beam::computeWakeLoss(Undulator *und)
+{
+  return col.computeLoss(this, und);
+}
+
+
 // Reports any effect that Beam::track applies but the GPU backend does not yet
 // implement. Used to refuse GPU tracking rather than silently dropping physics.
 bool Beam::gpuUnsupportedPhysics(string &what) const
 {
   if (incoherent.isEnabled()) { what = "incoherent synchrotron radiation (isr_loss/isr_spread)"; return true; }
-  if (col.hasWakeDefined())   { what = "collective effects / wakefields"; return true; }
   if (solver.hasShortRangeSC()){ what = "short-range space charge (nz/nphi in &efield)"; return true; }
   return false;
 }

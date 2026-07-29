@@ -99,8 +99,8 @@ timings under a GPU label. The messages are explicit about the reason:
 *** Error: gpu = true in &track, but ngrid = 151 is not supported by the Metal
     field solver, which handles powers of two from 64 to 1024. Set ngrid = 128
     in &field. ...
-*** Error: gpu = true in &track, but collective effects / wakefields is not
-    implemented on the GPU yet
+*** Error: gpu = true in &track, but incoherent synchrotron radiation
+    (isr_loss/isr_spread) is not implemented on the GPU yet
 ```
 
 ## What is supported
@@ -115,7 +115,8 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 | bunching harmonics | up to 8; beyond that the diagnostics fall back to the CPU |
 | `one4one` | not supported; the backend wants a rectangular particle array |
 | chicanes, correctors | that one step falls back to the CPU and is reported once |
-| ISR, wakefields, short-range space charge | hard error |
+| wakefields (`&wake`) | supported, including the resistive wall |
+| ISR, short-range space charge | hard error |
 
 The `ngrid` restriction is the awkward one. Genesis decks traditionally use an
 odd `ngrid` so that a grid point sits exactly on axis, but that convention buys
@@ -155,6 +156,29 @@ beam moments stay at 3.2e-6 throughout.
 Note that the field solver on the GPU is always the FFT one. `fft_fieldsolver`
 in `&track` only selects the CPU solver, so it makes no difference to a
 `gpu = true` run, but it does need to be set on both sides of any comparison.
+
+### Wakefields
+
+A `&wake` block works on the GPU, including the resistive wall wake, the
+geometric and roughness wakes and the external `loss` term. The split of work
+follows the structure of the physics rather than the structure of the code. A
+wake is driven by the current of a slice, not by the coordinates of individual
+particles, so the loss it produces is one number per slice and every particle in
+that slice receives the same energy kick. Building the loss profile requires the
+current of the whole bunch, which under MPI lives on several ranks and is
+gathered with `MPI_Allgather`; applying it requires only an addition.
+
+The gather and the convolution therefore stay on the host, exactly as on the CPU
+path, and the GPU does the addition. Nothing has to come back from the GPU to
+make this work, because the slice currents are fixed for the duration of a run:
+particles do not migrate between slices. Residency is preserved.
+
+The cost is small. On the 500-slice example the resistive wall wake adds under
+3% to the runtime with `transient = false`, which is the host-side convolution
+being computed once. With `transient = true` the convolution is repeated on
+every step and the run takes about 2.6 times as long, all of it on the host.
+That is the same host work the CPU path does, so it is not a GPU limitation, but
+it does mean a transient wake dominates a run that is otherwise a second long.
 
 ## The worked example
 
@@ -267,6 +291,25 @@ plans its transforms with `FFTW_MEASURE`, so two runs of the *same* CPU binary
 on the same machine differ by `1e-15` to `1e-9` depending on which plan the
 planner happened to pick. If you are chasing a discrepancy, run the same binary
 twice first and use that as the control.
+
+Wakefields were checked the same way, on the 500-slice deck with a copper
+resistive wall wake at a 2.5 mm radius, CPU and GPU both at 4 ranks. The number
+that matters is not the CPU-to-GPU difference on its own but its size relative
+to the effect being modelled, so the third column repeats the comparison against
+a run with the `&wake` block removed:
+
+| | GPU vs CPU | wake vs no wake |
+|---|---:|---:|
+| `Beam/wakefield` | 0 | 1.0 |
+| `Beam/energy` | 4.0e-10 | 4.0e-05 |
+| `Beam/bunching` | 3.5e-04 | 8.5e-03 |
+| `Field/power` | 1.7e-04 | 2.8e-03 |
+
+`Beam/wakefield` is identical because it is the host-side loss profile, written
+straight out by both paths. Everywhere else the wake changes the answer by one
+to two orders of magnitude more than the two processors differ, and the
+CPU-to-GPU column is unchanged from the no-wake case, so adding the wake has not
+cost any accuracy.
 
 ## Performance notes
 

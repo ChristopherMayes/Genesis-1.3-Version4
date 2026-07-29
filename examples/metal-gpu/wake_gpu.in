@@ -1,0 +1,67 @@
+# Resistive wall wakefield on the GPU.
+#
+#   mpirun -n 4 genesis4 wake_gpu.in
+#
+# A `&wake` block is supported on the GPU. The loss profile is one number per
+# slice, because a wake is driven by the slice current rather than by individual
+# particles, so the host builds the profile exactly as it does on the CPU path
+# and the GPU only adds it to the particles.
+#
+# To check it against the CPU, copy this file, set gpu=false, and compare. To
+# see how much the wake is doing, delete the &wake block and compare against
+# that instead: on this deck it shifts Beam/energy by about 4e-5 and
+# Beam/bunching by about 8e-3, which is far above the CPU-to-GPU difference.
+#
+# Setting transient=true makes the host recompute the convolution on every step
+# rather than once. That is host work, identical on both paths, and it costs
+# roughly 2.6x the runtime here.
+
+&setup
+rootname=wake_gpu
+lattice=Aramis.lat
+beamline=ARAMIS
+lambda0=1e-10
+gamma0=11357.82
+delz=0.045000
+shotnoise=1
+seed=1001
+nbins=8
+beam_global_stat=true
+field_global_stat=true
+&end
+
+&lattice
+zmatch=9.5
+&end
+
+&time
+slen=4.0e-7
+sample=8
+&end
+
+&field
+power=0
+dgrid=2.000000e-04
+ngrid=256
+waist_size=30e-6
+&end
+
+&beam
+current=3000
+delgam=1.000000
+ex=4.000000e-07
+ey=4.000000e-07
+&end
+
+&wake
+material=CU
+radius=2.5e-3
+roundpipe=true
+transient=false
+&end
+
+&track
+gpu=true
+fft_fieldsolver=true
+zstop=10
+&end
