@@ -133,11 +133,18 @@ loop.
 
 | `ngrid` | REGS x LANES | radices used | time for the SASE example |
 |---:|---:|---|---:|
-| 64 | 8 x 8 | 8, 8 | 6.60 s |
-| 128 | 16 x 8 | 16, 8 | 6.75 s |
-| 256 | 16 x 16 | 16, 16 | 7.45 s |
-| 512 | 32 x 16 | 32, 16 | 11.0 s |
-| 1024 | 32 x 32 | 32, 32 | 23.5 s |
+| 64 | 8 x 8 | 8, 8 | 0.78 s |
+| 128 | 16 x 8 | 16, 8 | 0.95 s |
+| 256 | 16 x 16 | 16, 16 | 1.53 s |
+| 512 | 32 x 16 | 32, 16 | 3.93 s |
+| 1024 | 32 x 32 | 32, 32 | 14.8 s |
+
+The cost is close to the `N^2 log N` the transform implies once the grid is big
+enough to fill the machine: 64 to 128 barely moves because a 64-point grid does
+not saturate the GPU, and from 256 upwards each doubling costs about 2.6x, then
+3.8x. Earlier versions of this table were flat at around 7 s across the whole
+range because a host-side diagnostic bug dominated every configuration; see the
+performance notes below.
 
 Agreement with the CPU degrades gently with grid size, because the transform is
 single precision and a larger grid means more rounding steps in each butterfly
@@ -268,20 +275,23 @@ Wall clock for the tracking loop, as Genesis reports it, on an M1 Max
 
 | ranks | `sase_cpu.in` | `sase_gpu.in` |
 |---:|---:|---:|
-| 1 | 415.7 s | 7.45 s |
-| 2 | — | 4.24 s |
-| 4 | 98.5 s | 2.58 s |
-| 8 | 54.2 s | 1.94 s |
+| 1 | 375.8 s | 1.55 s |
+| 2 | — | 1.14 s |
+| 4 | 97.8 s | 0.95 s |
+| 8 | 53.3 s | 1.02 s |
 
-So the single GPU at one rank is about 56x one core and about 7x all eight,
-and about 28x all eight once the ranks are used on both sides.
+So the single GPU at one rank is about 240x one core and about 34x all eight,
+and the best GPU configuration is about 56x the best CPU one.
 
-**Run several MPI ranks against the one GPU.** It is worth another 2.9x at
-four ranks and 3.8x at eight, even though there is only one GPU and the ranks
-are queueing on it. The reason is that a good part of a step is still host
-work — assembling the diagnostics into the output buffers, the global sums,
-the HDF5 writes — and one rank's host work overlaps another rank's GPU work.
-There is no advantage in going past the number of performance cores.
+**Running several MPI ranks against the one GPU helps, but only up to a point.**
+Two ranks are worth 1.4x and four are worth 1.6x; eight are slower than four.
+The ranks queue on a single GPU, so once the host is out of the way there is
+nothing left to overlap and the extra ranks only add communication and startup.
+Four is a good default on this machine. Earlier versions of this document
+claimed 2.9x at four ranks and 3.8x at eight, and explained it as host
+diagnostic work overlapping GPU work. That explanation was correct about the
+mechanism but the host work in question was almost entirely a bug, and with it
+fixed the effect largely disappears.
 
 **`export FI_PROVIDER=tcp` is not optional** if you are using conda's MPICH on
 macOS. The default libfabric provider busy-polls while waiting, and the faster
@@ -289,20 +299,21 @@ the compute gets the more of the machine that wastes:
 
 | | without | with |
 |---|---:|---:|
-| `validate.in`, serial, no `mpirun` | 22.1 s | 5.08 s |
-| `sase_gpu.in`, 8 ranks | 40.9 s | 1.94 s |
+| `validate.in`, serial, no `mpirun` | 21.8 s | 5.02 s |
+| `sase_gpu.in`, 8 ranks | 31.2 s | 1.15 s |
 
 The first row has no MPI communication in it at all — one rank, launched
 directly — and still loses a factor of four. Put the export in your shell
 profile.
 
 **Startup is not free.** The Metal shaders are compiled from source when the
-first `&track` block starts, which is about five seconds. It does not scale
-with the problem, but it is why the 1.94 s tracking run above takes about 8 s
-of wall clock end to end. Longer runs amortise it; it is only worth thinking
-about if you are timing something small.
+first `&track` block starts. It does not scale with the problem, but now that
+the tracking loop itself is around a second it is a visible part of the wall
+clock end to end. Longer runs amortise it; it is only worth thinking about if
+you are timing something small.
 
 **`output_step` matters much less than it used to.** The per-slice diagnostics
-are computed on the GPU now, by one threadgroup per slice, so `output_step = 1`
-costs very little. On the CPU path it was around three quarters of the runtime
-for this deck.
+are computed on the GPU, by one threadgroup per slice, so `output_step = 1`
+costs very little: 1.57 s against 1.45 s at `output_step = 100` for this deck.
+That was not true before the host-side diagnostic assembly was fixed, when the
+same pair was 7.33 s and 1.48 s.

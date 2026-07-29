@@ -40,13 +40,13 @@ path alongside and report the difference).
 
 | config | wall | vs 1 CPU core | vs 8 CPU cores |
 |---|---|---|---|
-| CPU 1 rank | 379.5 s | 1× | — |
-| CPU 8 ranks | 61.1 s | 6.2× | 1× |
-| GPU 1 rank | **7.47 s** | **50.8×** | **8.2×** |
-| GPU 4 ranks (one GPU) | **2.58 s** | **147×** | **23.7×** |
+| CPU 1 rank | 375.8 s | 1× | — |
+| CPU 8 ranks | 53.3 s | 7.0× | 1× |
+| GPU 1 rank | **1.55 s** | **242×** | **34×** |
+| GPU 4 ranks (one GPU) | **0.95 s** | **396×** | **56×** |
 
-Running several MPI ranks against the single GPU is worth another 2.9×: the host-side
-diagnostic assembly and HDF5 buffering overlap with GPU work.
+Extra MPI ranks against the single GPU are worth only about 1.6× and stop helping past
+four: the ranks queue on one GPU and there is no longer any host work left to overlap.
 
 Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize` 4.8e-05,
 `Beam/bunching` 2.7e-04, `Beam/energyspread` 3.7e-06 — the FP32 level throughout.
@@ -59,8 +59,16 @@ Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize
 - [ ] Port `Incoherent`, `Collective`/wakefields and short-range space charge (hard error today)
 - [ ] Chicanes and correctors fall back to the CPU for that step — port `applyR56`
 - [ ] `one4one` is refused outright (the GPU wants a rectangular particle array)
-- [ ] The remaining ~5 s of single-rank host time is diagnostic assembly in `Diagnostic.cpp`
-      (the `storeValue` loops and the global sums), not GPU work
+- [x] Host-side diagnostic assembly. It was ~5 s of the 7.4 s single-rank time. Most of it was
+      not `storeValue` at all but `DiagBeamUser::getValues`, which evaluated a `sin`/`cos` per
+      particle per slice per step for an output that is disabled by default and then discarded
+      the result. Guarding that, plus hoisting the map lookups out of the slice loops in
+      `DiagBeam` and `DiagField`, took `output_step = 1` from 7.33 s to 1.57 s. The same code
+      runs in a CPU-only build, where a profile puts `DiagBeamUser` at 2.0% and all of
+      `Diagnostic::calc` at 17.9% of the run — worth having, but below the run-to-run noise of
+      a 370 s job. Should go upstream on its own branch off master.
+- [ ] `fieldMoments` is now 22% of single-rank time and runs every step. It only feeds the
+      diagnostics, so it could be skipped on steps that produce no output.
 
 ### Constraints that must not be forgotten
 

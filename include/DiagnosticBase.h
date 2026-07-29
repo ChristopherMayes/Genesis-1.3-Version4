@@ -66,11 +66,31 @@ struct FilterDiagnostics{
 class DiagBase{
 protected:
     void storeValue(std::map<std::string,std::vector<double> >&val, std::string, unsigned long, double);
+    // The keys written by getValues() are the same for every slice, so looking
+    // them up once per step and then writing through the pointer avoids two
+    // map lookups and a string construction per value per slice. A null
+    // pointer means the key is not among the requested outputs, which is the
+    // case storeValue() handles by doing nothing.
+    static std::vector<double>* resolveValue(std::map<std::string,std::vector<double> >&val,
+                                             const std::string &field);
+    static void putValue(std::vector<double> *dest, unsigned long index, double value);
 };
 
 inline void DiagBase::storeValue(std::map<std::string,std::vector<double> >&container,std::string field, unsigned long index, double value)
 {
     if (container.find(field) != container.end()){container[field].at(index)=value;}
+}
+
+inline std::vector<double>* DiagBase::resolveValue(std::map<std::string,std::vector<double> >&container,
+                                                  const std::string &field)
+{
+    auto it = container.find(field);
+    return (it == container.end()) ? nullptr : &it->second;
+}
+
+inline void DiagBase::putValue(std::vector<double> *dest, unsigned long index, double value)
+{
+    if (dest != nullptr) { dest->at(index) = value; }
 }
 
 
