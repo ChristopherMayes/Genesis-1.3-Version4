@@ -107,7 +107,13 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     // lossless to FP32; the tracking still runs on the CPU below.
     // TODO: promote the switch to a &track namelist flag once the kernels land.
     MetalEngine metal;
-    bool useMetal = (getenv("GENESIS_METAL") != nullptr);
+    const char *metalEnv = getenv("GENESIS_METAL");
+    bool useMetal = (metalEnv != nullptr);
+    // GENESIS_METAL=1 runs the GPU solve alongside the CPU one and reports the
+    // difference; GENESIS_METAL=2 lets the GPU result drive the simulation.
+    bool metalDrive = useMetal && (atoi(metalEnv) >= 2);
+    double metalFieldErr = 0;
+    int metalSteps = 0;
     if (useMetal) {
         string reason;
         if (!MetalEngine::available()) {
@@ -172,9 +178,35 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ---------------------------------------
 	  // step 4 - Advance radiation field
 
+#ifdef G4_METAL
+	  // Validation stage: run the GPU field solve on a copy of the current
+	  // state, let the CPU do the real step, then compare. The host arrays are
+	  // untouched by this, so the physics is unaffected unless metalDrive is on.
+	  // Marshalling every step makes it slow -- that is expected here,
+	  // residency comes later.
+	  if (useMetal) {
+	    metal.upload(beam, field);
+	    metal.fieldStep(und, field, delz);
+	  }
+#endif
+
 	  for (int i=0; i<field->size();i++){
 	    field->at(i)->track(delz,beam,und);
 	  }
+
+#ifdef G4_METAL
+	  if (useMetal) {
+	    MetalEngine::SyncError e = metal.compare(beam, field);
+	    metalFieldErr = max(metalFieldErr, e.field);
+	    if (metalSteps < 3 && rank == 0) {
+	      cout << "  Metal field step " << metalSteps << ": rel err " << e.field << endl;
+	    }
+	    metalSteps++;
+	    if (metalDrive) {
+	      metal.downloadField(field);
+	    }
+	  }
+#endif
 
 
 	  //-----------------------------------------
@@ -196,6 +228,13 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	    diag.calc(beam, field, und->getz());
 	  }
 	}
+
+#ifdef G4_METAL
+	if (useMetal && rank == 0) {
+	  cout << "Metal field solve vs CPU over " << metalSteps
+	       << " steps: max relative error " << metalFieldErr << endl;
+	}
+#endif
      
         //---------------------------
         // end and clean-up 

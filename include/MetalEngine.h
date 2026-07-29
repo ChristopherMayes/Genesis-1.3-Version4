@@ -6,6 +6,7 @@
 
 class Beam;
 class Field;
+class Undulator;
 
 // GPU backend for Apple Silicon (Metal, FP32).
 //
@@ -45,6 +46,13 @@ class MetalEngine {
     // not for the inner loop.
     void upload(Beam *beam, std::vector<Field *> *field);
     void download(Beam *beam, std::vector<Field *> *field);
+    void downloadField(std::vector<Field *> *field);
+
+    // Field solve for one integration step: the equivalent of calling
+    // Field::track on every harmonic, but for all slices at once and entirely
+    // on the resident buffers. Reads the resident beam, writes the resident
+    // field. Blocks until the GPU is done.
+    void fieldStep(Undulator *und, std::vector<Field *> *field, double delz);
 
     // Largest relative difference between the host arrays and the resident GPU
     // copy, without modifying either. Checks the marshalling in isolation; both
