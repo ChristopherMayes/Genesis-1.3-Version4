@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "SliceMoments.h"
+
 class Beam;
 class Field;
 class Undulator;
@@ -61,6 +63,11 @@ class MetalEngine {
     // in which case the caller must fall back to the CPU.
     bool beamStep(Beam *beam, Undulator *und, std::vector<Field *> *field,
                   double delz, std::string &reason);
+
+    // Per-slice diagnostic reductions, computed from the resident copies so
+    // that no particle or grid array has to cross to the host.
+    bool beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) const;
+    bool fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) const;
 
     // Largest relative difference between the host arrays and the resident GPU
     // copy, without modifying either. Checks the marshalling in isolation; both

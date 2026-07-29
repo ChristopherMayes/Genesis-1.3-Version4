@@ -145,6 +145,182 @@ kernel void r16_cols_add(device float2* d [[buffer(0)]], const device float2* W 
     }
 }
 
+// ---------------- diagnostic reductions ----------------
+// One threadgroup of 256 threads per slice. The partial sums are folded first
+// across each SIMD group and then across the eight groups, which keeps the
+// threadgroup traffic to eight floats per quantity.
+
+constant uint NSIMD = 8;
+
+inline float tg_sum(float v, threadgroup float* sh, uint t){
+    v = simd_sum(v);
+    if ((t & 31u) == 0u) { sh[t >> 5]  = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = 0;
+    for (uint i = 0; i < NSIMD; i++) { r += sh[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+inline float tg_min(float v, threadgroup float* sh, uint t){
+    v = simd_min(v);
+    if ((t & 31u) == 0u) { sh[t >> 5] = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = sh[0];
+    for (uint i = 1; i < NSIMD; i++) { r = min(r, sh[i]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+inline float tg_max(float v, threadgroup float* sh, uint t){
+    v = simd_max(v);
+    if ((t & 31u) == 0u) { sh[t >> 5] = v; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = sh[0];
+    for (uint i = 1; i < NSIMD; i++) { r = max(r, sh[i]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+constant uint MAXBH = 8;    // largest bunchharm handled on the GPU
+constant uint BSTRIDE = 32; // floats of output per slice
+constant uint FSTRIDE = 16;
+
+struct BMPar { float gref; uint npart, nharm, doAux; };
+
+kernel void beam_moments(const device float* X  [[buffer(0)]],
+                         const device float* Y  [[buffer(1)]],
+                         const device float* PX [[buffer(2)]],
+                         const device float* PY [[buffer(3)]],
+                         const device float* G  [[buffer(4)]],
+                         const device float* TH [[buffer(5)]],
+                         device float* out      [[buffer(6)]],
+                         constant BMPar& P      [[buffer(7)]],
+                         uint slice [[threadgroup_position_in_grid]],
+                         uint t     [[thread_index_in_threadgroup]],
+                         uint nt    [[threads_per_threadgroup]]){
+    threadgroup float sh[NSIMD];
+    const uint np = P.npart;
+    const ulong o = (ulong)slice * np;
+
+    // first pass: means, and the bunching factor which needs no centring
+    float sx=0, sy=0, spx=0, spy=0, sg=0;
+    float2 b[MAXBH];
+    for (uint h=0; h<MAXBH; h++) { b[h] = float2(0.0f, 0.0f); }
+    for (uint i=t; i<np; i+=nt){
+        sx += X[o+i]; sy += Y[o+i]; spx += PX[o+i]; spy += PY[o+i]; sg += G[o+i];
+        float th = TH[o+i];
+        for (uint h=0; h<P.nharm; h++){
+            float a = float(h+1) * th;
+            b[h] += float2(cos(a), sin(a));
+        }
+    }
+    sx = tg_sum(sx, sh, t); sy = tg_sum(sy, sh, t);
+    spx = tg_sum(spx, sh, t); spy = tg_sum(spy, sh, t); sg = tg_sum(sg, sh, t);
+    for (uint h=0; h<P.nharm; h++){
+        b[h].x = tg_sum(b[h].x, sh, t);
+        b[h].y = tg_sum(b[h].y, sh, t);
+    }
+
+    const float n = 1.0f / float(np);
+    const float mx = sx*n, my = sy*n, mpx = spx*n, mpy = spy*n, mg = sg*n;
+
+    // second pass: centred second moments
+    float cx=0, cy=0, cpx=0, cpy=0, cg=0, cxpx=0, cypy=0;
+    for (uint i=t; i<np; i+=nt){
+        float dx = X[o+i]-mx, dy = Y[o+i]-my;
+        float dpx = PX[o+i]-mpx, dpy = PY[o+i]-mpy, dg = G[o+i]-mg;
+        cx += dx*dx; cy += dy*dy; cpx += dpx*dpx; cpy += dpy*dpy; cg += dg*dg;
+        cxpx += dx*dpx; cypy += dy*dpy;
+    }
+    cx = tg_sum(cx, sh, t); cy = tg_sum(cy, sh, t);
+    cpx = tg_sum(cpx, sh, t); cpy = tg_sum(cpy, sh, t); cg = tg_sum(cg, sh, t);
+    cxpx = tg_sum(cxpx, sh, t); cypy = tg_sum(cypy, sh, t);
+
+    device float* r = out + (ulong)slice * BSTRIDE;
+    if (t == 0){
+        r[0]=mx; r[1]=my; r[2]=mpx; r[3]=mpy; r[4]=mg;
+        r[5]=cx*n; r[6]=cy*n; r[7]=cpx*n; r[8]=cpy*n; r[9]=cg*n;
+        r[10]=cxpx*n; r[11]=cypy*n;
+        for (uint h=0; h<P.nharm; h++){ r[12+2*h]=b[h].x*n; r[13+2*h]=b[h].y*n; }
+    }
+
+    if (P.doAux == 0u) { return; }
+    float xmn=1e30, xmx=-1e30, ymn=1e30, ymx=-1e30;
+    float pxmn=1e30, pxmx=-1e30, pymn=1e30, pymx=-1e30, gmn=1e30, gmx=-1e30;
+    for (uint i=t; i<np; i+=nt){
+        float vx=X[o+i], vy=Y[o+i], vpx=PX[o+i], vpy=PY[o+i], vg=G[o+i];
+        xmn=min(xmn,vx); xmx=max(xmx,vx); ymn=min(ymn,vy); ymx=max(ymx,vy);
+        pxmn=min(pxmn,vpx); pxmx=max(pxmx,vpx); pymn=min(pymn,vpy); pymx=max(pymx,vpy);
+        gmn=min(gmn,vg); gmx=max(gmx,vg);
+    }
+    xmn=tg_min(xmn,sh,t); xmx=tg_max(xmx,sh,t); ymn=tg_min(ymn,sh,t); ymx=tg_max(ymx,sh,t);
+    pxmn=tg_min(pxmn,sh,t); pxmx=tg_max(pxmx,sh,t);
+    pymn=tg_min(pymn,sh,t); pymx=tg_max(pymx,sh,t);
+    gmn=tg_min(gmn,sh,t); gmx=tg_max(gmx,sh,t);
+    if (t == 0){
+        r[20]=xmn; r[21]=xmx; r[22]=ymn; r[23]=ymx;
+        r[24]=pxmn; r[25]=pxmx; r[26]=pymn; r[27]=pymx; r[28]=gmn; r[29]=gmx;
+    }
+}
+
+struct FMPar { uint ngrid, isfar; float shift, wscale; };
+
+// Intensity-weighted transverse moments of one slice. With isfar != 0 the input
+// is the transform of the slice and the cell index is FFT-shifted, matching the
+// far-field branch of DiagField::getValues.
+//
+// wscale exists because the transform is unnormalised: |FFT|^2 is up to ngrid^4
+// times the cell intensity, and dx^2*|FFT|^2 then overflows FP32 outright at
+// ngrid = 256. Every quantity derived from these sums is a ratio, so scaling
+// them all by a constant is free.
+kernel void field_moments(const device float2* F [[buffer(0)]],
+                          device float* out      [[buffer(1)]],
+                          constant FMPar& P      [[buffer(2)]],
+                          uint slice [[threadgroup_position_in_grid]],
+                          uint t     [[thread_index_in_threadgroup]],
+                          uint nt    [[threads_per_threadgroup]]){
+    threadgroup float sh[NSIMD];
+    const uint ng = P.ngrid, nn = ng*ng, hng = (ng+1u)/2u;
+    const device float2* f = F + (ulong)slice * nn;
+
+    float p=0, sx=0, sy=0, fr=0, fi=0;
+    for (uint i=t; i<nn; i+=nt){
+        uint ix = i % ng, iy = i / ng;
+        uint j = (P.isfar != 0u) ? (((iy+hng)%ng)*ng + ((ix+hng)%ng)) : i;
+        float2 c = f[j] * P.wscale;
+        float w = c.x*c.x + c.y*c.y;
+        float dx = float(ix) + P.shift, dy = float(iy) + P.shift;
+        p += w; sx += dx*w; sy += dy*w; fr += c.x; fi += c.y;
+    }
+    p = tg_sum(p, sh, t); sx = tg_sum(sx, sh, t); sy = tg_sum(sy, sh, t);
+    fr = tg_sum(fr, sh, t); fi = tg_sum(fi, sh, t);
+
+    const float xc = (p > 0.0f) ? sx/p : 0.0f;
+    const float yc = (p > 0.0f) ? sy/p : 0.0f;
+
+    float cx=0, cy=0;
+    for (uint i=t; i<nn; i+=nt){
+        uint ix = i % ng, iy = i / ng;
+        uint j = (P.isfar != 0u) ? (((iy+hng)%ng)*ng + ((ix+hng)%ng)) : i;
+        float2 c = f[j] * P.wscale;
+        float w = c.x*c.x + c.y*c.y;
+        float dx = float(ix) + P.shift - xc, dy = float(iy) + P.shift - yc;
+        cx += dx*dx*w; cy += dy*dy*w;
+    }
+    cx = tg_sum(cx, sh, t); cy = tg_sum(cy, sh, t);
+
+    if (t == 0){
+        device float* r = out + (ulong)slice * FSTRIDE + (P.isfar != 0u ? 7u : 0u);
+        r[0]=p; r[1]=sx; r[2]=sy; r[3]=cx; r[4]=cy;
+        if (P.isfar == 0u){ r[5]=fr; r[6]=fi; }
+    }
+}
+
+kernel void copy_field(device float2* dst [[buffer(0)]],
+                       const device float2* src [[buffer(1)]],
+                       uint i [[thread_position_in_grid]]){
+    dst[i] = src[i];
+}
+
 // ---------------- source deposition ----------------
 
 struct DepPar {
@@ -393,6 +569,18 @@ struct PushPar {
     uint32_t onGrid[kMaxHarm];
 };
 
+enum { kMaxBunchHarm = 8, kBeamStride = 32, kFieldStride = 16 };
+
+struct BMPar {
+    float gref;
+    uint32_t npart, nharm, doAux;
+};
+
+struct FMPar {
+    uint32_t ngrid, isfar;
+    float shift, wscale;
+};
+
 struct MetalEngine::Impl {
     id<MTLDevice> dev {nil};
     id<MTLCommandQueue> queue {nil};
@@ -421,7 +609,12 @@ struct MetalEngine::Impl {
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
+    // Diagnostic reduction output, a fixed number of floats per slice.
+    id<MTLBuffer> bBM {nil};
+    id<MTLBuffer> bFM {nil};
+
     id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA, pTrk, pPush;
+    id<MTLComputePipelineState> pBM, pFM, pCopy;
 
     size_t bytes {0};
 
@@ -523,8 +716,10 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         // The radix-16 field solver is written for a 16 x 16 decomposition.
         if (f->ngrid != 256) {
             std::ostringstream os;
-            os << "ngrid = " << f->ngrid
-               << ": the Metal field solver currently implements only ngrid = 256";
+            os << "ngrid = " << f->ngrid << " is not supported by the Metal field "
+                  "solver, which currently implements only ngrid = 256. Set ngrid = 256 "
+                  "in &field. Genesis decks traditionally use an odd ngrid so that a grid "
+                  "point sits exactly on axis, but nothing in the physics requires that.";
             reason = os.str();
             return false;
         }
@@ -599,6 +794,13 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         return false;
     }
 
+    p_->bBM = alloc(static_cast<size_t>(p_->nslice) * kBeamStride * sizeof(float));
+    p_->bFM = alloc(static_cast<size_t>(p_->nslice) * kFieldStride * sizeof(float));
+    if (p_->bBM == nil || p_->bFM == nil) {
+        reason = "diagnostic buffer allocation failed";
+        return false;
+    }
+
     std::complex<float> *W = (std::complex<float> *)[p_->bW contents];
     for (int m = 0; m < ng; m++) {
         const double a = -2.0 * M_PI * m / ng;
@@ -633,6 +835,9 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pColA = pso(@"r16_cols_add");
     p_->pTrk = pso(@"track_beam");
     p_->pPush = pso(@"push_beam");
+    p_->pBM = pso(@"beam_moments");
+    p_->pFM = pso(@"field_moments");
+    p_->pCopy = pso(@"copy_field");
     if (!ok) {
         reason = "compute pipeline creation failed";
         return false;
@@ -916,8 +1121,189 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
     return true;
 }
 
+bool MetalEngine::beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) const
+{
+    if (nharm < 1 || nharm > kMaxBunchHarm) { return false; }
+
+    @autoreleasepool {
+        BMPar P;
+        P.gref = static_cast<float>(p_->gref);
+        P.npart = static_cast<uint32_t>(p_->npart);
+        P.nharm = static_cast<uint32_t>(nharm);
+        P.doAux = wantAux ? 1u : 0u;
+
+        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p_->pBM];
+        [e setBuffer:p_->bX offset:0 atIndex:0];
+        [e setBuffer:p_->bY offset:0 atIndex:1];
+        [e setBuffer:p_->bPX offset:0 atIndex:2];
+        [e setBuffer:p_->bPY offset:0 atIndex:3];
+        [e setBuffer:p_->bG offset:0 atIndex:4];
+        [e setBuffer:p_->bT offset:0 atIndex:5];
+        [e setBuffer:p_->bBM offset:0 atIndex:6];
+        [e setBytes:&P length:sizeof(P) atIndex:7];
+        [e dispatchThreadgroups:MTLSizeMake(p_->nslice, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+
+    const int ns = p_->nslice;
+    out.nslice = ns;
+    out.nharm = nharm;
+    out.hasAux = wantAux;
+    auto fill = [ns](std::vector<double> &v) { v.assign(ns, 0.0); };
+    fill(out.x1); fill(out.x2); fill(out.y1); fill(out.y2);
+    fill(out.px1); fill(out.px2); fill(out.py1); fill(out.py2);
+    fill(out.g1); fill(out.g2); fill(out.xpx); fill(out.ypy);
+    out.bre.assign(static_cast<size_t>(ns) * nharm, 0.0);
+    out.bim.assign(static_cast<size_t>(ns) * nharm, 0.0);
+    if (wantAux) {
+        fill(out.xmin); fill(out.xmax); fill(out.ymin); fill(out.ymax);
+        fill(out.pxmin); fill(out.pxmax); fill(out.pymin); fill(out.pymax);
+        fill(out.gmin); fill(out.gmax);
+    }
+
+    // Undo the centring in double. x2 = <(x-<x>)^2> + <x>^2 reproduces the raw
+    // moment to double precision, while the GPU never had to subtract two
+    // nearly equal single precision numbers.
+    const float *r = (const float *)[p_->bBM contents];
+    for (int is = 0; is < ns; is++) {
+        const float *s = r + static_cast<size_t>(is) * kBeamStride;
+        const double x1 = s[0], y1 = s[1], px1 = s[2], py1 = s[3];
+        const double g1 = p_->gref + s[4];
+        out.x1[is] = x1;   out.x2[is] = s[5] + x1 * x1;
+        out.y1[is] = y1;   out.y2[is] = s[6] + y1 * y1;
+        out.px1[is] = px1; out.px2[is] = s[7] + px1 * px1;
+        out.py1[is] = py1; out.py2[is] = s[8] + py1 * py1;
+        out.g1[is] = g1;   out.g2[is] = s[9] + g1 * g1;
+        out.xpx[is] = s[10] + x1 * px1;
+        out.ypy[is] = s[11] + y1 * py1;
+        for (int h = 0; h < nharm; h++) {
+            out.bre[static_cast<size_t>(is) * nharm + h] = s[12 + 2 * h];
+            out.bim[static_cast<size_t>(is) * nharm + h] = s[13 + 2 * h];
+        }
+        if (wantAux) {
+            out.xmin[is] = s[20]; out.xmax[is] = s[21];
+            out.ymin[is] = s[22]; out.ymax[is] = s[23];
+            out.pxmin[is] = s[24]; out.pxmax[is] = s[25];
+            out.pymin[is] = s[26]; out.pymax[is] = s[27];
+            out.gmin[is] = p_->gref + s[28];
+            out.gmax[is] = p_->gref + s[29];
+        }
+    }
+    return true;
+}
+
+bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) const
+{
+    if (ih < 0 || ih >= static_cast<int>(p_->bField.size())) { return false; }
+
+    const int ns = p_->nslice;
+    const int ng = p_->ngrid[ih];
+    const size_t nn = static_cast<size_t>(ng) * ng;
+
+    @autoreleasepool {
+        FMPar P;
+        P.ngrid = static_cast<uint32_t>(ng);
+        P.isfar = 0;
+        P.shift = static_cast<float>(-0.5 * (ng - 1));
+        P.wscale = 1.0f;
+
+        const float fwd = -1.0f, one = 1.0f;
+        const MTLSize rowTG = MTLSizeMake(ng / 8, ns, 1);
+        const MTLSize rowT = MTLSizeMake(8 * 16, 1, 1);
+        const MTLSize colTG = MTLSizeMake(ng / 16, ns, 1);
+        const MTLSize colT = MTLSizeMake(16 * 16, 1, 1);
+        const MTLSize slices = MTLSizeMake(ns, 1, 1);
+        const MTLSize tg = MTLSizeMake(256, 1, 1);
+
+        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+
+        [e setComputePipelineState:p_->pFM];
+        [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
+        [e setBuffer:p_->bFM offset:0 atIndex:1];
+        [e setBytes:&P length:sizeof(P) atIndex:2];
+        [e dispatchThreadgroups:slices threadsPerThreadgroup:tg];
+
+        if (wantFar) {
+            // The near field has to survive, so transform a copy. bSrc is only
+            // live inside fieldStep, so it is free to borrow here.
+            [e setComputePipelineState:p_->pCopy];
+            [e setBuffer:p_->bSrc offset:0 atIndex:0];
+            [e setBuffer:p_->bField[ih] offset:0 atIndex:1];
+            [e dispatchThreads:MTLSizeMake(nn * ns, 1, 1) threadsPerThreadgroup:tg];
+
+            [e setComputePipelineState:p_->pRow];
+            [e setBuffer:p_->bSrc offset:0 atIndex:0];
+            [e setBuffer:p_->bW offset:0 atIndex:1];
+            [e setBytes:&fwd length:4 atIndex:2];
+            [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
+
+            [e setComputePipelineState:p_->pCol];
+            [e setBuffer:p_->bSrc offset:0 atIndex:0];
+            [e setBuffer:p_->bW offset:0 atIndex:1];
+            [e setBytes:&fwd length:4 atIndex:2];
+            [e setBytes:&one length:4 atIndex:3];
+            [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
+
+            FMPar F = P;
+            F.isfar = 1;
+            F.wscale = 1.0f / static_cast<float>(ng);
+            [e setComputePipelineState:p_->pFM];
+            [e setBuffer:p_->bSrc offset:0 atIndex:0];
+            [e setBuffer:p_->bFM offset:0 atIndex:1];
+            [e setBytes:&F length:sizeof(F) atIndex:2];
+            [e dispatchThreadgroups:slices threadsPerThreadgroup:tg];
+        }
+
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+
+    out.nslice = ns;
+    out.hasFar = wantFar;
+    auto fill = [ns](std::vector<double> &v) { v.assign(ns, 0.0); };
+    fill(out.power); fill(out.x1); fill(out.x2); fill(out.y1); fill(out.y2);
+    fill(out.ffre); fill(out.ffim); fill(out.midre); fill(out.midim);
+    if (wantFar) {
+        fill(out.fpower); fill(out.fx1); fill(out.fx2); fill(out.fy1); fill(out.fy2);
+    }
+
+    const float *r = (const float *)[p_->bFM contents];
+    const std::complex<float> *fld =
+        (const std::complex<float> *)[p_->bField[ih] contents];
+    const size_t mid = (nn - 1) / 2;
+    auto uncentre = [](double c, double s1, double w) {
+        return (w > 0.0) ? c + s1 * s1 / w : 0.0;
+    };
+    for (int is = 0; is < ns; is++) {
+        const float *s = r + static_cast<size_t>(is) * kFieldStride;
+        out.power[is] = s[0];
+        out.x1[is] = s[1];  out.y1[is] = s[2];
+        out.x2[is] = uncentre(s[3], s[1], s[0]);
+        out.y2[is] = uncentre(s[4], s[2], s[0]);
+        out.ffre[is] = s[5]; out.ffim[is] = s[6];
+        if (wantFar) {
+            out.fpower[is] = s[7];
+            out.fx1[is] = s[8];  out.fy1[is] = s[9];
+            out.fx2[is] = uncentre(s[10], s[8], s[7]);
+            out.fy2[is] = uncentre(s[11], s[9], s[7]);
+        }
+        const std::complex<float> c = fld[static_cast<size_t>(is) * nn + mid];
+        out.midre[is] = c.real();
+        out.midim[is] = c.imag();
+    }
+    return true;
+}
+
 void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
 {
+
     const int ns = p_->nslice, np = p_->npart;
     float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
     float *g = p_->fg(), *t = p_->ft();

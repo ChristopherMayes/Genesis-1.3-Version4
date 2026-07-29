@@ -260,17 +260,34 @@ bool Diagnostic::writeToOutputFile(Beam *beam, vector<Field*> *field, Setup *set
 
 // wrapper to do all the diagnostics calculation at a given integration step iz.
 void Diagnostic::calc(Beam* beam,std::vector<Field*> *field,double z) {
+    this->calc(beam, field, z, nullptr, nullptr);
+}
+
+void Diagnostic::calc(Beam* beam,std::vector<Field*> *field,double z,
+                      const BeamSliceMoments *bm,
+                      const std::vector<FieldSliceMoments> *fm) {
     // lock the vectors holding the instances of diagnostic classes
     diag_can_add=false;
 
     zout[iz]=z;
     for (auto group: dbeam){
+        // only the official beam diagnostic knows how to take precomputed
+        // moments; user diagnostics keep reducing the particles themselves
+        DiagBeam *db = dynamic_cast<DiagBeam*>(group);
+        if (db != nullptr) { db->usePrecomputed(bm); }
         group->getValues(beam,val[2],iz);
+        if (db != nullptr) { db->usePrecomputed(nullptr); }
     }
 
     for (int ifld=0; ifld < field->size(); ifld++){
         for (auto group: dfield) {
+            DiagField *df = dynamic_cast<DiagField*>(group);
+            const FieldSliceMoments *m =
+                (fm != nullptr && ifld < static_cast<int>(fm->size())) ? &fm->at(ifld)
+                                                                       : nullptr;
+            if (df != nullptr) { df->usePrecomputed(m); }
             group->getValues(field->at(ifld),val[3+ifld],iz);
+            if (df != nullptr) { df->usePrecomputed(nullptr); }
         }
     }
     iz++;
@@ -412,6 +429,25 @@ void DiagBeam::getValues(Beam *beam,std::map<std::string,std::vector<double> >&v
         for (int iharm = 0; iharm < nharm; iharm++) {
             b[iharm] = 0;
         }
+        if (pre != nullptr) {
+            x1 = pre->x1[is];   x2 = pre->x2[is];
+            y1 = pre->y1[is];   y2 = pre->y2[is];
+            px1 = pre->px1[is]; px2 = pre->px2[is];
+            py1 = pre->py1[is]; py2 = pre->py2[is];
+            g1 = pre->g1[is];   g2 = pre->g2[is];
+            xpx = pre->xpx[is]; ypy = pre->ypy[is];
+            for (int iharm = 0; iharm < nharm && iharm < pre->nharm; iharm++) {
+                b[iharm] = complex<double>(pre->bre[is * pre->nharm + iharm],
+                                           pre->bim[is * pre->nharm + iharm]);
+            }
+            if (filter["aux"] && pre->hasAux) {
+                xmin = pre->xmin[is];   xmax = pre->xmax[is];
+                pxmin = pre->pxmin[is]; pxmax = pre->pxmax[is];
+                ymin = pre->ymin[is];   ymax = pre->ymax[is];
+                pymin = pre->pymin[is]; pymax = pre->pymax[is];
+                gmin = pre->gmin[is];   gmax = pre->gmax[is];
+            }
+        } else {
         for (auto const &par: slice) {
             x1 += par.x;
             x2 += par.x * par.x;
@@ -468,6 +504,7 @@ void DiagBeam::getValues(Beam *beam,std::map<std::string,std::vector<double> >&v
         ypy *= norm;
         for (int iharm = 0; iharm < nharm; iharm++) {
             b[iharm] *= norm;
+        }
         }
 
         //-------------------------------------------------------------------------------
@@ -747,7 +784,7 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
     complex<double> *in  = nullptr;
     complex<double> *out = nullptr;
     fftw_plan p;
-    obtain_FFT_resources(ngrid, &in, &out, &p);
+    if (pre == nullptr) { obtain_FFT_resources(ngrid, &in, &out, &p); }
 #endif
 
 
@@ -760,6 +797,26 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         double y2 = 0;
         complex<double> loc;
         complex<double> ff = complex<double>(0, 0);
+#ifdef FFTW
+        double fpower=0;
+        double fx1=0;
+        double fx2=0;
+        double fy1=0;
+        double fy2=0;
+#endif
+        if (pre != nullptr) {
+            power = pre->power[is0];
+            x1 = pre->x1[is0]; x2 = pre->x2[is0];
+            y1 = pre->y1[is0]; y2 = pre->y2[is0];
+            ff = complex<double>(pre->ffre[is0], pre->ffim[is0]);
+#ifdef FFTW
+            if (filter["fft"] && pre->hasFar) {
+                fpower = pre->fpower[is0];
+                fx1 = pre->fx1[is0]; fx2 = pre->fx2[is0];
+                fy1 = pre->fy1[is0]; fy2 = pre->fy2[is0];
+            }
+#endif
+        } else {
         for (int iy = 0; iy < ngrid; iy++) {
             double dy = static_cast<double>(iy) + shift;
             for (int ix = 0; ix < ngrid; ix++) {
@@ -780,12 +837,6 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         }
 
 #ifdef FFTW
-        double fpower=0;
-        double fx1=0;
-        double fx2=0;
-        double fy1=0;
-        double fy2=0;
-
         if (filter["fft"]){
             fftw_execute(p);
             for (int iy=0;iy<ngrid;iy++){
@@ -806,6 +857,7 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
             }
         }
 #endif
+        }
 
         if (global) {
             g_pow += power;
@@ -853,7 +905,8 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         // of the grid, where the field is orders of magnitude smaller than on
         // axis. This form is identical for odd ngrid and correct for even.
         int i=(ngrid/2)*ngrid+(ngrid/2);
-        loc=slice.at(i);
+        loc = (pre != nullptr) ? complex<double>(pre->midre[is0], pre->midim[is0])
+                               : slice.at(i);
         double inten=loc.real()*loc.real()+loc.imag()*loc.imag();
         double intenphi=atan2(loc.imag(),loc.real());
         double farfield=ff.real()*ff.real()+ff.imag()*ff.imag();

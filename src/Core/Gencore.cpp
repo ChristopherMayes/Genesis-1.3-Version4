@@ -115,6 +115,26 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     bool metalBeamOK = false;
     int metalSteps = 0;
     int metalFallback = 0;
+    BeamSliceMoments metalBM;
+    vector<FieldSliceMoments> metalFM;
+    auto metalMoments = [&](Beam *b, vector<Field *> *f) -> bool {
+        // Step 5 applies the slippage on the host, which rotates the field ring
+        // buffer and zeroes a boundary slice, so the resident copy is a step out
+        // of date by the time the diagnostics run. Re-sync it here; the
+        // per-slice slippage exchange that makes this unnecessary is still to
+        // come.
+        metal.upload(b, f);
+        if (!metal.beamMoments(filter.beam.harm, filter.beam.auxiliar, metalBM)) {
+            return false;
+        }
+        metalFM.resize(f->size());
+        for (size_t i = 0; i < f->size(); i++) {
+            if (!metal.fieldMoments(static_cast<int>(i), filter.field.fft, metalFM[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (useMetal) {
         string reason;
         if (!MetalEngine::available()) {
@@ -259,7 +279,19 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  //}
 
 	  if (und->outstep()) {
+#ifdef G4_METAL
+	    // The diagnostics are a per-slice reduction over exactly the arrays
+	    // that already live on the GPU, and they dominate the run once the
+	    // tracking is fast: on 500 slices at ngrid=256 they were 76% of the
+	    // wall time. Reduce them there instead of on the host.
+	    if (metalDrive && metalMoments(beam, field)) {
+	      diag.calc(beam, field, und->getz(), &metalBM, &metalFM);
+	    } else {
+	      diag.calc(beam, field, und->getz());
+	    }
+#else
 	    diag.calc(beam, field, und->getz());
+#endif
 	  }
 	}
 
