@@ -29,11 +29,16 @@ extern const double eev;
 // synchronisation beyond command-buffer completion.
 static const MTLResourceOptions kShared = MTLResourceStorageModeShared;
 
-// The radix-16 transform decomposes 256 as 16 x 16: 16 threads per 256-point
-// FFT, each holding 16 complex values in registers, with a single threadgroup
-// exchange. That is 2.2x faster than a radix-2 shuffle ladder and also more
-// accurate (two stages instead of eight). It is specific to ngrid = 256, which
-// init() enforces.
+// The transform is a four-step Cooley-Tukey decomposition N = REGS * LANES:
+// LANES threads cooperate on one N-point FFT, each holding REGS complex values
+// in registers, with a single threadgroup exchange between the two stages.
+// That is 2.2x faster than a radix-2 shuffle ladder and also more accurate,
+// because it is two stages rather than log2(N).
+//
+// The shape is chosen per grid size in init() and injected as preprocessor
+// macros when the library is compiled, so each build of the shader is
+// specialised to one ngrid. At ngrid = 256 this reproduces the original
+// 16 x 16 radix-16 kernel exactly.
 //
 // The propagation uses only two of the three transforms in the textbook form
 //     field = IFFT(FFT(field)*expK + 2*FFT(src))/ngrid^2
@@ -46,25 +51,55 @@ static NSString *kMSL = @R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint N = 256, RF = 8, CC = 16;
+constant uint N = NG;
 
 inline float2 cmul(float2 a, float2 b){ return float2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
+
+// Twiddle stride: the table holds W_N, so W_P^m lives at index (NG/P)*m.
+#define WSTRIDE(P) ((uint)(NG)/(uint)(P))
 
 inline void dft4(thread float2* a, float s){
     float2 t0=a[0]+a[2], t1=a[0]-a[2], t2=a[1]+a[3], d=a[1]-a[3];
     float2 t3 = float2(s*d.y, -s*d.x);
     a[0]=t0+t2; a[1]=t1+t3; a[2]=t0-t2; a[3]=t1-t3;
 }
-// 16-point DFT in registers, in place. Output is left permuted:
-// slot j holds frequency perm(j) = 4*(j&3) + (j>>2). The caller folds that
-// permutation into its store index, which avoids a 16-element temporary.
+// The register DFTs below all leave their output permuted: for a P-point
+// transform written as P = P1 x P2, slot P2*k1 + k2 holds frequency k1 + P1*k2.
+// The caller folds that permutation into its store index, which avoids a
+// P-element temporary and the dynamic indexing that comes with it.
+//
+//   dft8   8 = 2 x 4   slot j holds frequency (j>>2) + 2*(j&3)
+//   dft16  16 = 4 x 4  slot j holds frequency (j>>2) + 4*(j&3)
+//   dft32  32 = 4 x 8  slot j holds frequency (j>>3) + 4*(j&7)
+
+inline void dft8(thread float2* a, const device float2* W, float s){
+    for (uint n2=0;n2<4;n2++){
+        float2 u=a[n2], v=a[4+n2];
+        float2 w = W[(WSTRIDE(8)*n2) & (N-1u)]; w.y *= s;
+        a[n2]   = u+v;
+        a[4+n2] = cmul(u-v, w);
+    }
+    float2 t[4];
+    for (uint k1=0;k1<2;k1++){
+        for (uint n2=0;n2<4;n2++) t[n2]=a[4*k1+n2];
+        dft4(t,s);
+        for (uint k2=0;k2<4;k2++) a[4*k1+k2]=t[k2];
+    }
+}
+// Natural-order 8-point transform, needed as the inner stage of dft32.
+inline void dft8n(thread float2* a, const device float2* W, float s){
+    dft8(a, W, s);
+    float2 t[8];
+    for (uint j=0;j<8;j++) t[j]=a[j];
+    for (uint j=0;j<8;j++) a[(j>>2) + 2u*(j&3u)] = t[j];
+}
 inline void dft16(thread float2* a, const device float2* W, float s){
     float2 t[4];
     for (uint n2=0;n2<4;n2++){
         for (uint j=0;j<4;j++) t[j]=a[4*j+n2];
         dft4(t,s);
         for (uint k1=0;k1<4;k1++){
-            float2 w = W[(16u*n2*k1) & 255u]; w.y *= s;
+            float2 w = W[(WSTRIDE(16)*n2*k1) & (N-1u)]; w.y *= s;
             a[4*k1+n2] = cmul(t[k1], w);
         }
     }
@@ -74,75 +109,123 @@ inline void dft16(thread float2* a, const device float2* W, float s){
         for (uint k2=0;k2<4;k2++) a[4*k1+k2]=t[k2];
     }
 }
-// 256-point FFT across 16 threads. On entry a[n1] = x[16*n1+lane];
-// on exit slot j holds X[16*perm(j)+lane].
-// The exchange index is XOR-swizzled to avoid 16-way bank conflicts without
-// padding, which is what lets 16 columns share one threadgroup (exactly the
-// 32 KB limit).
-inline void fft256_r16(thread float2* a, threadgroup float2* s,
-                       const device float2* W, uint lane, float sgn){
-    dft16(a, W, sgn);
-    for (uint j=0;j<16;j++){
-        uint k1 = 4u*(j&3u) + (j>>2);
-        float2 w = W[(lane*k1) & 255u]; w.y *= sgn;
-        s[k1*16u + (lane ^ k1)] = cmul(a[j], w);
+inline void dft32(thread float2* a, const device float2* W, float s){
+    float2 t[8];
+    for (uint n2=0;n2<8;n2++){
+        for (uint j=0;j<4;j++) t[j]=a[8*j+n2];
+        dft4(t,s);
+        for (uint k1=0;k1<4;k1++){
+            float2 w = W[(WSTRIDE(32)*n2*k1) & (N-1u)]; w.y *= s;
+            a[8*k1+n2] = cmul(t[k1], w);
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint n2=0;n2<16;n2++) a[n2] = s[lane*16u + (n2 ^ lane)];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    dft16(a, W, sgn);
+    for (uint k1=0;k1<4;k1++){
+        for (uint n2=0;n2<8;n2++) t[n2]=a[8*k1+n2];
+        dft8n(t, W, s);
+        for (uint k2=0;k2<8;k2++) a[8*k1+k2]=t[k2];
+    }
 }
 
-kernel void r16_rows(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+// Select the two stages. REGS is the first stage, done once per thread; LANES
+// is the second, done CHUNK = REGS/LANES times per thread after the exchange.
+#if REGS == 8
+#  define DFT_REGS(a)  dft8(a, W, sgn)
+#  define PERM_REGS(j) (((j)>>2) + 2u*((j)&3u))
+#elif REGS == 16
+#  define DFT_REGS(a)  dft16(a, W, sgn)
+#  define PERM_REGS(j) (((j)>>2) + 4u*((j)&3u))
+#elif REGS == 32
+#  define DFT_REGS(a)  dft32(a, W, sgn)
+#  define PERM_REGS(j) (((j)>>3) + 4u*((j)&7u))
+#endif
+
+#if LANES == 8
+#  define DFT_LANES(a)  dft8(a, W, sgn)
+#  define PERM_LANES(j) (((j)>>2) + 2u*((j)&3u))
+#elif LANES == 16
+#  define DFT_LANES(a)  dft16(a, W, sgn)
+#  define PERM_LANES(j) (((j)>>2) + 4u*((j)&3u))
+#elif LANES == 32
+#  define DFT_LANES(a)  dft32(a, W, sgn)
+#  define PERM_LANES(j) (((j)>>3) + 4u*((j)&7u))
+#endif
+
+// N-point FFT across LANES threads. On entry a[n1] = x[LANES*n1 + lane].
+// On exit slot cc*LANES + j holds X[(lane + cc*LANES) + REGS*PERM_LANES(j)].
+// The exchange index is XOR-swizzled to avoid bank conflicts without padding,
+// which is what lets several transforms share one threadgroup allocation.
+inline void fftN(thread float2* a, threadgroup float2* s,
+                 const device float2* W, uint lane, float sgn){
+    DFT_REGS(a);
+    for (uint j=0;j<REGS;j++){
+        uint k1 = PERM_REGS(j);
+        float2 w = W[(lane*k1) & (N-1u)]; w.y *= sgn;
+        s[k1*LANES + (lane ^ (k1 & (LANES-1u)))] = cmul(a[j], w);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint n2=0;n2<LANES;n2++)
+            a[cc*LANES+n2] = s[(lane + cc*LANES)*LANES + (n2 ^ lane)];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint cc=0;cc<CHUNK;cc++) DFT_LANES(a + cc*LANES);
+}
+// Frequency held by output slot cc*LANES + j in the thread with this lane.
+#define OUTK(cc,j) ((lane + (cc)*LANES) + REGS*PERM_LANES(j))
+
+kernel void fft_rows(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                      constant float& sgn [[buffer(2)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
-    threadgroup float2 sh[RF*256];
-    uint lane = t & 15u, r = t >> 4;
-    device float2* p = d + (ulong)tg.y*(N*N) + (ulong)(tg.x*RF + r)*N;
-    float2 a[16];
-    for (uint n1=0;n1<16;n1++) a[n1] = p[16u*n1 + lane];
-    fft256_r16(a, sh + r*256u, W, lane, sgn);
-    for (uint j=0;j<16;j++) p[16u*(4u*(j&3u)+(j>>2)) + lane] = a[j];
+    threadgroup float2 sh[RF_ROWS*NG];
+    uint lane = t % LANES, r = t / LANES;
+    device float2* p = d + (ulong)tg.y*((ulong)N*N) + (ulong)(tg.x*RF_ROWS + r)*N;
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = p[LANES*n1 + lane];
+    fftN(a, sh + r*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
 }
-kernel void r16_rows_mul(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+kernel void fft_rows_mul(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                          constant float& sgn [[buffer(2)]], const device float2* expK [[buffer(3)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
-    threadgroup float2 sh[RF*256];
-    uint lane = t & 15u, r = t >> 4;
-    ulong row = (ulong)(tg.x*RF + r);
-    device float2* p = d + (ulong)tg.y*(N*N) + row*N;
+    threadgroup float2 sh[RF_ROWS*NG];
+    uint lane = t % LANES, r = t / LANES;
+    ulong row = (ulong)(tg.x*RF_ROWS + r);
+    device float2* p = d + (ulong)tg.y*((ulong)N*N) + row*N;
     const device float2* k = expK + row*N;
-    float2 a[16];
-    for (uint n1=0;n1<16;n1++) a[n1] = cmul(p[16u*n1 + lane], k[16u*n1 + lane]);
-    fft256_r16(a, sh + r*256u, W, lane, sgn);
-    for (uint j=0;j<16;j++) p[16u*(4u*(j&3u)+(j>>2)) + lane] = a[j];
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = cmul(p[LANES*n1 + lane], k[LANES*n1 + lane]);
+    fftN(a, sh + r*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
 }
-kernel void r16_cols(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+kernel void fft_cols(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                      constant float& sgn [[buffer(2)]], constant float& scale [[buffer(3)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
-    threadgroup float2 sh[CC*256];
-    uint c = t % CC, lane = t / CC;
-    device float2* b = d + (ulong)tg.y*(N*N) + (ulong)tg.x*CC + c;
-    float2 a[16];
-    for (uint n1=0;n1<16;n1++) a[n1] = b[(ulong)(16u*n1+lane)*N];
-    fft256_r16(a, sh + c*256u, W, lane, sgn);
-    for (uint j=0;j<16;j++) b[(ulong)(16u*(4u*(j&3u)+(j>>2))+lane)*N] = a[j]*scale;
+    threadgroup float2 sh[CC_COLS*NG];
+    uint c = t % CC_COLS, lane = t / CC_COLS;
+    device float2* b = d + (ulong)tg.y*((ulong)N*N) + (ulong)tg.x*CC_COLS + c;
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = b[(ulong)(LANES*n1+lane)*N];
+    fftN(a, sh + c*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++) b[(ulong)OUTK(cc,j)*N] = a[cc*LANES+j]*scale;
 }
-kernel void r16_cols_add(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+kernel void fft_cols_add(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                          constant float& sgn [[buffer(2)]], constant float& scale [[buffer(3)]],
                          const device float2* src [[buffer(4)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
-    threadgroup float2 sh[CC*256];
-    uint c = t % CC, lane = t / CC;
-    ulong off = (ulong)tg.y*(N*N) + (ulong)tg.x*CC + c;
+    threadgroup float2 sh[CC_COLS*NG];
+    uint c = t % CC_COLS, lane = t / CC_COLS;
+    ulong off = (ulong)tg.y*((ulong)N*N) + (ulong)tg.x*CC_COLS + c;
     device float2* b = d + off; const device float2* sb = src + off;
-    float2 a[16];
-    for (uint n1=0;n1<16;n1++) a[n1] = b[(ulong)(16u*n1+lane)*N];
-    fft256_r16(a, sh + c*256u, W, lane, sgn);
-    for (uint j=0;j<16;j++){
-        ulong q = (ulong)(16u*(4u*(j&3u)+(j>>2))+lane)*N;
-        b[q] = a[j]*scale + 2.0f*sb[q];
-    }
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = b[(ulong)(LANES*n1+lane)*N];
+    fftN(a, sh + c*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++){
+            ulong q = (ulong)OUTK(cc,j)*N;
+            b[q] = a[cc*LANES+j]*scale + 2.0f*sb[q];
+        }
 }
 
 // ---------------- diagnostic reductions ----------------
@@ -599,6 +682,10 @@ struct MetalEngine::Impl {
     std::vector<id<MTLBuffer> > bField;
     std::vector<int> ngrid;
 
+    // FFT shape for this grid, chosen by pickFFTShape() and baked into the
+    // shader as preprocessor macros. lanes*regs == ngrid.
+    int lanes {0}, regs {0}, rowsPerTG {0}, colsPerTG {0};
+
     // Field solve scratch. The source is reused across harmonics because they
     // are propagated one at a time. expK depends on the harmonic (through xks)
     // and on the step length, so it is cached per harmonic and rebuilt when
@@ -654,6 +741,43 @@ std::string MetalEngine::deviceName()
 
 double MetalEngine::gammaRef() const { return p_->gref; }
 size_t MetalEngine::bytesResident() const { return p_->bytes; }
+
+// The FFT is a four-step decomposition ngrid = regs * lanes. lanes threads
+// cooperate on one transform, each holding regs complex values in registers and
+// exchanging once through threadgroup memory.
+//
+// regs is either lanes or 2*lanes; in the latter case each thread performs two
+// of the second-stage transforms after the exchange. rowsPerTG and colsPerTG
+// are how many transforms share one threadgroup, bounded by the 32 KB of
+// threadgroup memory (8 bytes per point) and by 1024 threads.
+//
+// Returns false if the size is not supported.
+static bool pickFFTShape(int ng, int &lanes, int &regs, int &rows, int &cols)
+{
+    switch (ng) {
+    case   64: lanes =  8; regs =  8; rows = 16; cols = 16; return true;
+    case  128: lanes =  8; regs = 16; rows = 16; cols = 16; return true;
+    case  256: lanes = 16; regs = 16; rows =  8; cols = 16; return true;
+    case  512: lanes = 16; regs = 32; rows =  4; cols =  8; return true;
+    case 1024: lanes = 32; regs = 32; rows =  2; cols =  4; return true;
+    default:   return false;
+    }
+}
+
+// Nearest supported size, for the error message. Ties go to the larger grid,
+// because dropping resolution silently is the worse surprise.
+static int nearestSupported(int ng)
+{
+    static const int sizes[] = {64, 128, 256, 512, 1024};
+    int best = sizes[0];
+    double bd = 1e300;
+    for (int i = 0; i < 5; i++) {
+        const double d = std::fabs(std::log(static_cast<double>(sizes[i])) -
+                                   std::log(static_cast<double>(ng > 0 ? ng : 1)));
+        if (d <= bd) { bd = d; best = sizes[i]; }
+    }
+    return best;
+}
 
 bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &reason)
 {
@@ -713,16 +837,23 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
             reason = os.str();
             return false;
         }
-        // The radix-16 field solver is written for a 16 x 16 decomposition.
-        if (f->ngrid != 256) {
+        // The FFT decomposes ngrid into two register stages, which needs a
+        // power of two between 64 and 1024.
+        int lanes, regs, rows, cols;
+        if (!pickFFTShape(f->ngrid, lanes, regs, rows, cols)) {
             std::ostringstream os;
-            os << "ngrid = " << f->ngrid << " is not supported by the Metal field "
-                  "solver, which currently implements only ngrid = 256. Set ngrid = 256 "
-                  "in &field. Genesis decks traditionally use an odd ngrid so that a grid "
+            os << "ngrid = " << f->ngrid << " is not supported by the Metal field solver, "
+                  "which handles powers of two from 64 to 1024. Set ngrid = "
+               << nearestSupported(f->ngrid)
+               << " in &field. Genesis decks traditionally use an odd ngrid so that a grid "
                   "point sits exactly on axis, but nothing in the physics requires that.";
             reason = os.str();
             return false;
         }
+        p_->lanes = lanes;
+        p_->regs = regs;
+        p_->rowsPerTG = rows;
+        p_->colsPerTG = cols;
         // The push kernel gathers every harmonic at one set of bilinear
         // weights, so all harmonics must share a grid.
         if (f->ngrid != field->at(0)->ngrid || f->dgrid != field->at(0)->dgrid ||
@@ -809,7 +940,19 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     }
 
     NSError *err = nil;
-    id<MTLLibrary> lib = [p_->dev newLibraryWithSource:kMSL options:nil error:&err];
+    // The FFT shape has to be a compile-time constant, because it sizes both
+    // the register arrays and the threadgroup allocation. The library is built
+    // from source at startup anyway, so it is simply specialised to this grid.
+    MTLCompileOptions *copt = [[MTLCompileOptions alloc] init];
+    copt.preprocessorMacros = @{
+        @"NG"      : @(ng),
+        @"LANES"   : @(p_->lanes),
+        @"REGS"    : @(p_->regs),
+        @"CHUNK"   : @(p_->regs / p_->lanes),
+        @"RF_ROWS" : @(p_->rowsPerTG),
+        @"CC_COLS" : @(p_->colsPerTG),
+    };
+    id<MTLLibrary> lib = [p_->dev newLibraryWithSource:kMSL options:copt error:&err];
     if (lib == nil) {
         reason = std::string("shader compilation failed: ") +
                  [[err localizedDescription] UTF8String];
@@ -829,10 +972,10 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     };
     p_->pZero = pso(@"zero_src");
     p_->pDep = pso(@"deposit");
-    p_->pRow = pso(@"r16_rows");
-    p_->pRowM = pso(@"r16_rows_mul");
-    p_->pCol = pso(@"r16_cols");
-    p_->pColA = pso(@"r16_cols_add");
+    p_->pRow = pso(@"fft_rows");
+    p_->pRowM = pso(@"fft_rows_mul");
+    p_->pCol = pso(@"fft_cols");
+    p_->pColA = pso(@"fft_cols_add");
     p_->pTrk = pso(@"track_beam");
     p_->pPush = pso(@"push_beam");
     p_->pBM = pso(@"beam_moments");
@@ -926,10 +1069,10 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
             }
 
             // field = IFFT(FFT(field)*expK)/ngrid^2 + 2*src, four passes.
-            const MTLSize rowTG = MTLSizeMake(ng / 8, ns, 1);
-            const MTLSize rowT = MTLSizeMake(8 * 16, 1, 1);
-            const MTLSize colTG = MTLSizeMake(ng / 16, ns, 1);
-            const MTLSize colT = MTLSizeMake(16 * 16, 1, 1);
+            const MTLSize rowTG = MTLSizeMake(ng / p_->rowsPerTG, ns, 1);
+            const MTLSize rowT = MTLSizeMake(p_->rowsPerTG * p_->lanes, 1, 1);
+            const MTLSize colTG = MTLSizeMake(ng / p_->colsPerTG, ns, 1);
+            const MTLSize colT = MTLSizeMake(p_->colsPerTG * p_->lanes, 1, 1);
 
             [e setComputePipelineState:p_->pRow];
             [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
@@ -1213,10 +1356,10 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
         P.wscale = 1.0f;
 
         const float fwd = -1.0f, one = 1.0f;
-        const MTLSize rowTG = MTLSizeMake(ng / 8, ns, 1);
-        const MTLSize rowT = MTLSizeMake(8 * 16, 1, 1);
-        const MTLSize colTG = MTLSizeMake(ng / 16, ns, 1);
-        const MTLSize colT = MTLSizeMake(16 * 16, 1, 1);
+        const MTLSize rowTG = MTLSizeMake(ng / p_->rowsPerTG, ns, 1);
+        const MTLSize rowT = MTLSizeMake(p_->rowsPerTG * p_->lanes, 1, 1);
+        const MTLSize colTG = MTLSizeMake(ng / p_->colsPerTG, ns, 1);
+        const MTLSize colT = MTLSizeMake(p_->colsPerTG * p_->lanes, 1, 1);
         const MTLSize slices = MTLSizeMake(ns, 1, 1);
         const MTLSize tg = MTLSizeMake(256, 1, 1);
 

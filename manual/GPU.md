@@ -97,7 +97,8 @@ timings under a GPU label. The messages are explicit about the reason:
 *** Error: gpu = true in &track, but this binary was built without the GPU
     backend. Reconfigure with -DENABLE_METAL=ON.
 *** Error: gpu = true in &track, but ngrid = 151 is not supported by the Metal
-    field solver, which currently implements only ngrid = 256. ...
+    field solver, which handles powers of two from 64 to 1024. Set ngrid = 128
+    in &field. ...
 *** Error: gpu = true in &track, but collective effects / wakefields is not
     implemented on the GPU yet
 ```
@@ -109,18 +110,40 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 
 | | |
 |---|---|
-| `ngrid` | must be **256**. The radix-16 transform is written for that size. |
+| `ngrid` | a power of two from **64 to 1024** |
 | field harmonics | up to 4, all sharing the same `ngrid`, `dgrid` and `gridmax` |
 | bunching harmonics | up to 8; beyond that the diagnostics fall back to the CPU |
 | `one4one` | not supported; the backend wants a rectangular particle array |
 | chicanes, correctors | that one step falls back to the CPU and is reported once |
 | ISR, wakefields, short-range space charge | hard error |
 
-`ngrid = 256` is the awkward one. Genesis decks traditionally use an odd
-`ngrid` so that a grid point sits exactly on axis, but that convention buys
+The `ngrid` restriction is the awkward one. Genesis decks traditionally use an
+odd `ngrid` so that a grid point sits exactly on axis, but that convention buys
 nothing physically and costs a lot in transform structure — `ngrid = 255` is
 `3 x 5 x 17`, a pathological FFT length that is about 1.5 times slower than 256
-even on the CPU. Sizes other than 256 will be added later.
+even on the CPU. The error message names the nearest supported size.
+
+Each grid size gets its own specialisation of the transform. The kernel is a
+four-step Cooley-Tukey decomposition `N = REGS x LANES`: every thread holds
+`REGS` points in registers, does a short DFT over them, exchanges through
+threadgroup memory, and finishes with `LANES`-point DFTs. The two factors are
+chosen per grid size and injected into the shader as preprocessor macros when
+the Metal library is compiled, so there is no runtime branching in the inner
+loop.
+
+| `ngrid` | REGS x LANES | radices used | time for the SASE example |
+|---:|---:|---|---:|
+| 64 | 8 x 8 | 8, 8 | 6.69 s |
+| 128 | 16 x 8 | 16, 8 | 6.79 s |
+| 256 | 16 x 16 | 16, 16 | 7.55 s |
+| 512 | 32 x 16 | 32, 16 | 10.8 s |
+| 1024 | 32 x 32 | 32, 32 | 23.2 s |
+
+Agreement with the CPU degrades gently with grid size, because the transform is
+single precision and a larger grid means more rounding steps in each butterfly
+chain. Over the 1104 steps of the validation deck the largest relative field
+difference is 9.2e-6 at `ngrid = 64`, 2.3e-4 at 256 and 8.5e-3 at 1024; the
+beam moments stay at 3.2e-6 throughout.
 
 Note that the field solver on the GPU is always the FFT one. `fft_fieldsolver`
 in `&track` only selects the CPU solver, so it makes no difference to a

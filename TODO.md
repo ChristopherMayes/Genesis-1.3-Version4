@@ -1,26 +1,21 @@
 # TODO
 
-## 1. Open the two pull requests
+## 1. The two upstream pull requests
 
-Both branches are pushed to `origin` (ChristopherMayes fork). Open **PR-1 first** — PR-2's body
-references it, because the three-FFT branch it touches is unreachable without the filter fix.
+Both are open **as drafts** against `svenreiche/Genesis-1.3-Version4`, ready for you to edit and
+then mark ready for review. Take #272 out of draft first — #273's body references it, because
+the three-FFT branch it touches is unreachable without the filter fix.
 
-```sh
-gh pr create --repo svenreiche/Genesis-1.3-Version4 --base master \
-  --head ChristopherMayes:fix/source-filter-noop \
-  --title "Fix source_filter being silently ignored in FieldSolverFFT" \
-  --body-file PR-1-source-filter-fix.md
+| PR | branch | commit | title |
+|---|---|---|---|
+| [#272](https://github.com/svenreiche/Genesis-1.3-Version4/pull/272) | `fix/source-filter-noop` | `4fe13fe` | Fix `source_filter` being silently ignored in `FieldSolverFFT` |
+| [#273](https://github.com/svenreiche/Genesis-1.3-Version4/pull/273) | `perf/fft-two-pass` | `e101b30` | `FieldSolverFFT`: drop the source-term FFT when the source filter is off |
 
-gh pr create --repo svenreiche/Genesis-1.3-Version4 --base master \
-  --head ChristopherMayes:perf/fft-two-pass \
-  --title "FieldSolverFFT: drop the source-term FFT when the source filter is off" \
-  --body-file PR-2-fft-two-pass.md
-```
+The bodies as submitted are `PR-1-source-filter-fix.md` and `PR-2-fft-two-pass.md`. Edit them on
+GitHub, not here — these files are only the record of what was sent.
 
-| branch | commit | state |
+| other branch | commit | state |
 |---|---|---|
-| `fix/source-filter-noop` | `4fe13fe` | pushed, ready |
-| `perf/fft-two-pass` | `e101b30` | pushed, ready |
 | `wip/fp32-precision` | `8f456e6` | local only, parked |
 | `tmp/merge-check` | `56781b4` | local scratch, safe to delete |
 
@@ -58,8 +53,9 @@ Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize
 
 ### Still to do
 
-- [ ] Generalise `ngrid` beyond 256 (needs `dft8` and `dft32`; see below). Currently a hard
-      error with a suggestion of the nearest supported size.
+- [x] Generalise `ngrid` beyond 256. The shader is now specialised per grid size through
+      preprocessor macros and supports every power of two from 64 to 1024; anything else is a
+      hard error naming the nearest supported size.
 - [ ] Port `Incoherent`, `Collective`/wakefields and short-range space charge (hard error today)
 - [ ] Chicanes and correctors fall back to the CPU for that step — port `applyR56`
 - [ ] `one4one` is refused outright (the GPU wants a rectangular particle array)
