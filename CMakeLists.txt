@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.12)
 project(Genesis_1_3_Version4 CXX C)
 
 option(USE_DPI "Use diagnostic plugin interface" OFF)
+option(ENABLE_METAL "Build the Apple Silicon GPU backend (macOS only)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENTIONS OFF)
@@ -76,6 +77,23 @@ endif()
 
 if(USE_DPI)
    set(SRC_DPI src/Main/RegPlugin.cpp src/Core/DiagnosticHook.cpp src/Core/DiagnosticHookBeam.cpp src/Core/DiagnosticHookLI.cpp)
+endif()
+
+# Apple Silicon GPU backend. Objective-C++, so it needs its own language and the
+# Metal frameworks. Everything is behind the G4_METAL macro, which means a build
+# without this option is bit-identical to the one before it existed.
+if(ENABLE_METAL)
+   if(NOT APPLE)
+      message(FATAL_ERROR "ENABLE_METAL requires macOS")
+   endif()
+   enable_language(OBJCXX)
+   set(CMAKE_OBJCXX_STANDARD 17)
+   set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+   find_library(METAL_LIBRARY Metal REQUIRED)
+   find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+   list(APPEND _libraries ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+   set(SRC_METAL src/Core/MetalEngine.mm)
+   message(STATUS "Metal GPU backend enabled")
 endif()
 
 
@@ -176,6 +194,7 @@ add_library(genesis13 STATIC
         src/Main/Track.cpp
         src/Main/Wake.cpp
         ${SRC_DPI}
+        ${SRC_METAL}
 )
 
 
@@ -194,6 +213,13 @@ endif()
 
 if(USE_DPI)
    target_compile_definitions(genesis13 PRIVATE USE_DPI)
+endif()
+
+if(ENABLE_METAL)
+   target_compile_definitions(genesis13 PRIVATE G4_METAL)
+   # Automatic reference counting for the Objective-C objects held by the engine.
+   set_source_files_properties(src/Core/MetalEngine.mm PROPERTIES
+           COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
 

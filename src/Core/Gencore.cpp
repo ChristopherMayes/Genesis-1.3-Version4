@@ -4,6 +4,11 @@
   #include "DiagnosticHookS.h"
 #endif
 
+#ifdef G4_METAL
+  #include "MetalEngine.h"
+  #include <cstdlib>
+#endif
+
 extern bool MPISingle;
 
 bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *und,bool isTime, bool isScan, bool periodic, FilterDiagnostics &filter)
@@ -95,6 +100,39 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     if (rank==0) { cout << "Initial analysis of electron beam and radiation field..."  << endl; }
     diag.init(rank, size, und->outlength(), beam->beam.size(),field->size(),isTime,isScan,filter);
     diag.calc(beam, field, und->getz());  // initial calculation
+
+#ifdef G4_METAL
+    // GPU backend, opt-in while it is being built up. At this stage it only
+    // allocates the resident buffers and checks that the host transfers are
+    // lossless to FP32; the tracking still runs on the CPU below.
+    // TODO: promote the switch to a &track namelist flag once the kernels land.
+    MetalEngine metal;
+    bool useMetal = (getenv("GENESIS_METAL") != nullptr);
+    if (useMetal) {
+        string reason;
+        if (!MetalEngine::available()) {
+            reason = "no Metal device with unified memory";
+            useMetal = false;
+        } else if (!metal.init(beam, field, reason)) {
+            useMetal = false;
+        }
+        if (!useMetal) {
+            if (rank == 0) {
+                cout << "Metal backend not used: " << reason << " - running on CPU" << endl;
+            }
+        } else {
+            metal.upload(beam, field);
+            MetalEngine::SyncError err = metal.compare(beam, field);
+            if (rank == 0) {
+                cout << "Metal backend: " << MetalEngine::deviceName() << ", "
+                     << metal.bytesResident() / (1024 * 1024) << " MB resident, gamma_ref = "
+                     << metal.gammaRef() << endl;
+                cout << "  host transfer check: field " << err.field
+                     << "   beam " << err.beam << " (relative, FP32 rounding is ~1e-7)" << endl;
+            }
+        }
+    }
+#endif
 
 	/*************/
 	/* MAIN LOOP */
