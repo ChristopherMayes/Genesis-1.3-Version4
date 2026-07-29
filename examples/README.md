@@ -19,3 +19,8 @@ In [Example 4](Example4-HGHG/), we explore the difference in one-4-one simulatio
 Examples are HGHG and EEHG cases, where the energy modulation and energy-dependent run-time differences in chicanes can shift electrons faraway from their original location, well beyond the wavelength of the FEL.
 
 ![Example 4, Fig 2](Example4-HGHG/Plots/Figure_2.png)
+
+## GPU on Apple Silicon
+In [metal-gpu](metal-gpu/), the Metal GPU backend is checked against the CPU on a
+steady-state case and then timed on a 500-slice SASE run. See
+[manual/GPU.md](../manual/GPU.md) for the full description.

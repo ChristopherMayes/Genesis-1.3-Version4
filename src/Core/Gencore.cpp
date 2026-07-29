@@ -30,6 +30,18 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
         cout << endl << "Running Core Simulation..." << endl;
     }
 
+#ifndef G4_METAL
+    // Without the backend compiled in, a deck asking for the GPU would quietly
+    // run on the CPU and the user would believe the timing.
+    if (gpu || gpuValidate) {
+        if (rank==0) {
+            cout << "*** Error: gpu = true in &track, but this binary was built without "
+                    "the GPU backend. Reconfigure with -DENABLE_METAL=ON." << endl;
+        }
+        return false;
+    }
+#endif
+
     //-----------------------------------------
 	// init beam, field and undulator class
 

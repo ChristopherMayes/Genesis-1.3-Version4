@@ -1,0 +1,56 @@
+# Self-check: run the GPU and the CPU side by side and report the difference.
+#
+# Steady state (no &time namelist), seeded, shotnoise off, so the result is
+# deterministic and the number printed at the end of the run is a regression
+# test rather than a noise measurement.
+#
+#   export FI_PROVIDER=tcp
+#   genesis4 validate.in
+#
+# FI_PROVIDER matters even here, with one rank and no mpirun: conda's MPICH
+# busy-polls without it and this run takes 22 s instead of 5 s.
+#
+# Expect, at the end of the run:
+#
+#   Metal vs CPU over 1104 steps: max relative error, field 2.3e-04, beam 3.3e-06
+#
+# Both numbers are the FP32 round-off level. Anything above ~1e-3 means the GPU
+# path is wrong on this machine, not merely less precise.
+
+&setup
+rootname=validate
+lattice=Aramis.lat
+beamline=ARAMIS
+lambda0=1e-10
+gamma0=11357.82
+delz=0.045000
+shotnoise=0
+nbins=8
+beam_global_stat=true
+field_global_stat=true
+&end
+
+&lattice
+zmatch=9.5
+&end
+
+&field
+power=5e3
+dgrid=2.000000e-04
+ngrid=256
+waist_size=30e-6
+&end
+
+&beam
+current=3000
+delgam=1.000000
+ex=4.000000e-07
+ey=4.000000e-07
+&end
+
+&track
+gpu=true
+gpu_validate=true
+fft_fieldsolver=true
+bunchharm=1
+&end

@@ -1,0 +1,55 @@
+# Timing and accuracy reference, CPU half.
+#
+# 500 slices of SASE at ngrid=256, 10 m of the ARAMIS undulator, diagnostics
+# every step. Identical to sase_gpu.in apart from rootname and the gpu flag,
+# including the shot-noise seed.
+#
+#   mpirun -n 8 genesis4 sase_cpu.in
+#
+# Run sase_gpu.in at the SAME number of ranks before comparing: Genesis pads
+# the slice count to a multiple of the rank count, and the shot-noise
+# realization depends on how the slices are distributed, so a 1-rank run and an
+# 8-rank run of this deck differ by ~7e-2 in Field/power on the CPU alone.
+
+&setup
+rootname=sase_cpu
+lattice=Aramis.lat
+beamline=ARAMIS
+lambda0=1e-10
+gamma0=11357.82
+delz=0.045000
+shotnoise=1
+seed=1001
+nbins=8
+beam_global_stat=true
+field_global_stat=true
+&end
+
+&lattice
+zmatch=9.5
+&end
+
+&time
+slen=4.0e-7
+sample=8
+&end
+
+&field
+power=0
+dgrid=2.000000e-04
+ngrid=256
+waist_size=30e-6
+&end
+
+&beam
+current=3000
+delgam=1.000000
+ex=4.000000e-07
+ey=4.000000e-07
+&end
+
+&track
+gpu=false
+fft_fieldsolver=true
+zstop=10
+&end

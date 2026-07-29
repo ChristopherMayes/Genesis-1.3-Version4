@@ -504,6 +504,8 @@ affect the actual FEL process. It is recommended to not use it unless you are ve
 - `xcut` (*double,1.*): relative cut in the spatial frequency components in the x-direction. A value of 1 aligns the edge of the sigmoid filter to half of the maximum resolvable frequency
 - `ycut` (*double, 1.*): same for the y direction
 - `sigmoid` (*double, 1.*): relative steepnes of the sigmoid filter.
+- `gpu` (*bool, false*): Runs this tracking block on the GPU. Requires a build configured with `-DENABLE_METAL=ON` and an Apple Silicon Mac; it is an error, not a silent fallback, if the GPU cannot be used. The GPU path is single precision and currently requires `ngrid = 256`. See [GPU Acceleration on Apple Silicon](GPU.md).
+- `gpu_validate` (*bool, false*): Runs the CPU path alongside the GPU one and reports the largest relative difference at the end of the block. A test mode, and slower than either path on its own. Combine with `fft_fieldsolver = true`, otherwise the difference reported is between the two field solvers rather than between the two processors.
 
 [Back](#supported-namelists)
 

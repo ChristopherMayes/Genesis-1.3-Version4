@@ -7,7 +7,14 @@ build_info.c
 cmake-build-debug/
 cmake-build-release/
 build/
+build-*/
 debug/*
 /benchmark/
 .idea/
+.DS_Store
+
+# simulation output
+*.out.h5
+*.par.h5
+*.fld.h5
 
