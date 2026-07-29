@@ -1303,7 +1303,23 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
 
 void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
 {
+    this->uploadBeam(beam);
 
+    for (size_t i = 0; i < p_->bField.size(); i++) {
+        const size_t nn = static_cast<size_t>(p_->ngrid[i]) * p_->ngrid[i];
+        std::complex<float> *dst = (std::complex<float> *)[p_->bField[i] contents];
+        for (int is = 0; is < p_->nslice; is++) {
+            const std::complex<double> *src = field->at(i)->field[is].data();
+            std::complex<float> *d = dst + static_cast<size_t>(is) * nn;
+            for (size_t k = 0; k < nn; k++) {
+                d[k] = std::complex<float>(src[k]);
+            }
+        }
+    }
+}
+
+void MetalEngine::uploadBeam(Beam *beam)
+{
     const int ns = p_->nslice, np = p_->npart;
     float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
     float *g = p_->fg(), *t = p_->ft();
@@ -1325,18 +1341,6 @@ void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
     float *cur = (float *)[p_->bCurrent contents];
     for (int is = 0; is < ns; is++) {
         cur[is] = static_cast<float>(beam->current[is]);
-    }
-
-    for (size_t i = 0; i < p_->bField.size(); i++) {
-        const size_t nn = static_cast<size_t>(p_->ngrid[i]) * p_->ngrid[i];
-        std::complex<float> *dst = (std::complex<float> *)[p_->bField[i] contents];
-        for (int is = 0; is < ns; is++) {
-            const std::complex<double> *src = field->at(i)->field[is].data();
-            std::complex<float> *d = dst + static_cast<size_t>(is) * nn;
-            for (size_t k = 0; k < nn; k++) {
-                d[k] = std::complex<float>(src[k]);
-            }
-        }
     }
 }
 
@@ -1387,6 +1391,37 @@ void MetalEngine::downloadField(std::vector<Field *> *field)
                 dst[k] = std::complex<double>(s[k]);
             }
         }
+    }
+}
+
+// Slippage moves exactly one slice per slip event, so the whole field does not
+// have to make the trip. These two keep that one slice consistent while the
+// rest of the grid stays resident.
+void MetalEngine::downloadFieldSlice(int ifld, int islice, Field *field)
+{
+    if (ifld < 0 || static_cast<size_t>(ifld) >= p_->bField.size()) { return; }
+    if (islice < 0 || islice >= p_->nslice) { return; }
+    const size_t nn = static_cast<size_t>(p_->ngrid[ifld]) * p_->ngrid[ifld];
+    const std::complex<float> *s =
+        (const std::complex<float> *)[p_->bField[ifld] contents] +
+        static_cast<size_t>(islice) * nn;
+    std::complex<double> *dst = field->field[islice].data();
+    for (size_t k = 0; k < nn; k++) {
+        dst[k] = std::complex<double>(s[k]);
+    }
+}
+
+void MetalEngine::uploadFieldSlice(int ifld, int islice, const Field *field)
+{
+    if (ifld < 0 || static_cast<size_t>(ifld) >= p_->bField.size()) { return; }
+    if (islice < 0 || islice >= p_->nslice) { return; }
+    const size_t nn = static_cast<size_t>(p_->ngrid[ifld]) * p_->ngrid[ifld];
+    std::complex<float> *d =
+        (std::complex<float> *)[p_->bField[ifld] contents] +
+        static_cast<size_t>(islice) * nn;
+    const std::complex<double> *src = field->field[islice].data();
+    for (size_t k = 0; k < nn; k++) {
+        d[k] = std::complex<float>(src[k]);
     }
 }
 

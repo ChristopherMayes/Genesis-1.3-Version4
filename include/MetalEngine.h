@@ -47,9 +47,15 @@ class MetalEngine {
     // Full state transfers. These are for setup, teardown and field dumps --
     // not for the inner loop.
     void upload(Beam *beam, std::vector<Field *> *field);
+    void uploadBeam(Beam *beam);
     void download(Beam *beam, std::vector<Field *> *field);
     void downloadField(std::vector<Field *> *field);
     void downloadBeam(Beam *beam);
+
+    // Single-slice transfers. Slippage moves exactly one slice per slip event,
+    // so it does not need the whole field to come back to the host.
+    void downloadFieldSlice(int ifld, int islice, Field *field);
+    void uploadFieldSlice(int ifld, int islice, const Field *field);
 
     // Field solve for one integration step: the equivalent of calling
     // Field::track on every harmonic, but for all slices at once and entirely

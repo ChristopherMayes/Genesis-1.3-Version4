@@ -101,6 +101,10 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     diag.init(rank, size, und->outlength(), beam->beam.size(),field->size(),isTime,isScan,filter);
     diag.calc(beam, field, und->getz());  // initial calculation
 
+    // Non-null only when an accelerator backend owns the field, so that the
+    // slippage can keep the backend's copy in step one slice at a time.
+    SliceSync *slipSync = nullptr;
+
 #ifdef G4_METAL
     // GPU backend, selected with `gpu = true` in &track. `gpu_validate = true`
     // additionally runs the CPU path every step and reports the largest
@@ -118,12 +122,7 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     BeamSliceMoments metalBM;
     vector<FieldSliceMoments> metalFM;
     auto metalMoments = [&](Beam *b, vector<Field *> *f) -> bool {
-        // Step 5 applies the slippage on the host, which rotates the field ring
-        // buffer and zeroes a boundary slice, so the resident copy is a step out
-        // of date by the time the diagnostics run. Re-sync it here; the
-        // per-slice slippage exchange that makes this unnecessary is still to
-        // come.
-        metal.upload(b, f);
+        (void)b;
         if (!metal.beamMoments(filter.beam.harm, filter.beam.auxiliar, metalBM)) {
             return false;
         }
@@ -135,6 +134,17 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
         }
         return true;
     };
+
+    // Lets Control::applySlippage move its one slice per slip event without
+    // dragging the whole field across.
+    struct MetalSliceSync : public SliceSync {
+        MetalEngine *e {nullptr};
+        vector<Field *> *f {nullptr};
+        void pullSlice(int ifld, int is) override { e->downloadFieldSlice(ifld, is, f->at(ifld)); }
+        void pushSlice(int ifld, int is) override { e->uploadFieldSlice(ifld, is, f->at(ifld)); }
+    } metalSync;
+    metalSync.e = &metal;
+    metalSync.f = field;
     if (useMetal) {
         string reason;
         if (!MetalEngine::available()) {
@@ -155,6 +165,11 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
             return false;
         }
         metal.upload(beam, field);
+        // In drive mode the host arrays are no longer the source of truth, so
+        // the slippage syncs itself one slice at a time and nothing else copies
+        // per step. In compare mode the CPU path runs too and both copies have
+        // to be updated the plain way.
+        if (metalDrive && !metalCompare) { slipSync = &metalSync; }
         MetalEngine::SyncError err = metal.compare(beam, field);
         if (rank == 0) {
             cout << "Metal backend: " << MetalEngine::deviceName() << ", "
@@ -180,6 +195,22 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ----------------------------------------
 	  // step 1 - apply most marker action  (always at beginning of a step)
 	  bool error_IO=false;
+#ifdef G4_METAL
+	  // A dump reads the host arrays, so the resident copy has to come back
+	  // first. getMarker() reports what is due before applyMarker acts on it:
+	  // bit 1 field dump, bit 2 beam dump, bit 4 sort.
+	  //
+	  // Nothing goes back afterwards. The dump is read-only, and Beam::sort()
+	  // only does anything for one4one, which MetalEngine::init refuses. An
+	  // upload here would be actively wrong in any case: this state is from
+	  // the top of the step, and by the time step 3 runs the GPU has already
+	  // advanced it, so writing it back rolls the beam back one step.
+	  if (metalDrive && !metalCompare) {
+	    const int mk = und->getMarker();
+	    if ((mk & 1) != 0) { metal.downloadField(field); }
+	    if ((mk & 2) != 0) { metal.downloadBeam(beam); }
+	  }
+#endif
 	  bool sort=control->applyMarker(beam, field, und, error_IO);
 	  if(error_IO) {
 	    return(false);
@@ -190,17 +221,16 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // step 2 - Advance electron beam
 
 #ifdef G4_METAL
-	  // The upload is still needed every step because the host arrays remain the
-	  // source of truth for diagnostics, slippage and sorting. Removing it is the
-	  // next stage of the port.
 	  if (useMetal) {
 	    string why;
-	    metal.upload(beam, field);
+	    // In drive mode the GPU copy is already the current state; the upload
+	    // is only there to feed the CPU path that compare mode also runs.
+	    if (!metalDrive || metalCompare) { metal.upload(beam, field); }
 	    metalBeamOK = metal.beamStep(beam, und, field, delz, why);
 	    if (!metalBeamOK) {
 	      // Localised elements the GPU does not handle (chicane, corrector).
-	      // Falling back for that step is correct because the host arrays are
-	      // in sync at this point.
+	      // Falling back needs the host arrays, so bring them over.
+	      if (metalDrive && !metalCompare) { metal.download(beam, field); }
 	      if (metalFallback == 0 && rank == 0) {
 		cout << "  Metal: falling back to the CPU for " << why << " steps" << endl;
 	      }
@@ -210,12 +240,16 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  if (!metalDrive || !metalBeamOK || metalCompare) {
 	    beam->track(delz,field,und);
 	  }
-	  if (useMetal && metalBeamOK) {
+	  if (useMetal) {
+	    if (!metalBeamOK && metalDrive && !metalCompare) {
+	      // The CPU did this step; hand the result back to the GPU.
+	      metal.upload(beam, field);
+	    }
 	    if (metalCompare) {
 	      MetalEngine::SyncError e = metal.compare(beam, field);
 	      metalBeamErr = max(metalBeamErr, e.beam);
 	    }
-	    if (metalDrive) { metal.downloadBeam(beam); }
+	    if (metalDrive && metalCompare) { metal.downloadBeam(beam); }
 	  }
 #else
 	  beam->track(delz,field,und);
@@ -230,7 +264,7 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 
 	    if (shift!=0){
 	      for (int i=0;i<field->size();i++){
-		      control->applySlippage(shift, field->at(i));
+		      control->applySlippage(shift, field->at(i), i, slipSync);
 	      }
 	    }
 	  }
@@ -240,7 +274,7 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 
 #ifdef G4_METAL
 	  if (useMetal) {
-	    metal.upload(beam, field);
+	    if (!metalDrive || metalCompare) { metal.upload(beam, field); }
 	    metal.fieldStep(und, field, delz);
 	  }
 	  if (!metalDrive || metalCompare) {
@@ -254,7 +288,7 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	      metalFieldErr = max(metalFieldErr, e.field);
 	    }
 	    metalSteps++;
-	    if (metalDrive) { metal.downloadField(field); }
+	    if (metalDrive && metalCompare) { metal.downloadField(field); }
 	  }
 #else
 	  for (int i=0; i<field->size();i++){
@@ -267,7 +301,7 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // step 5 - Apply slippage
 
 	  for (int i=0;i<field->size();i++){
-	    control->applySlippage(und->slippage(), field->at(i));  
+	    control->applySlippage(und->slippage(), field->at(i), i, slipSync);
 	  }
 
 	  //-------------------------------
@@ -296,14 +330,20 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	}
 
 #ifdef G4_METAL
-	if (useMetal && rank == 0) {
-	  if (metalCompare) {
-	    cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
-		 << metalFieldErr << ", beam " << metalBeamErr << endl;
-	  }
-	  if (metalFallback > 0) {
-	    cout << "Metal: " << metalFallback << " of " << metalSteps
-		 << " steps fell back to the CPU" << endl;
+	if (useMetal) {
+	  // The loop kept the state on the GPU; the host owns it again from here,
+	  // for the closing marker action, the output file and whatever namelist
+	  // follows this &track.
+	  if (metalDrive && !metalCompare) { metal.download(beam, field); }
+	  if (rank == 0) {
+	    if (metalCompare) {
+	      cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
+		   << metalFieldErr << ", beam " << metalBeamErr << endl;
+	    }
+	    if (metalFallback > 0) {
+	      cout << "Metal: " << metalFallback << " of " << metalSteps
+		   << " steps fell back to the CPU" << endl;
+	    }
 	  }
 	}
 #endif
