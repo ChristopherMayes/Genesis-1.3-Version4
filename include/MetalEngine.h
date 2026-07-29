@@ -47,12 +47,20 @@ class MetalEngine {
     void upload(Beam *beam, std::vector<Field *> *field);
     void download(Beam *beam, std::vector<Field *> *field);
     void downloadField(std::vector<Field *> *field);
+    void downloadBeam(Beam *beam);
 
     // Field solve for one integration step: the equivalent of calling
     // Field::track on every harmonic, but for all slices at once and entirely
     // on the resident buffers. Reads the resident beam, writes the resident
     // field. Blocks until the GPU is done.
     void fieldStep(Undulator *und, std::vector<Field *> *field, double delz);
+
+    // Beam step: transverse half step, Runge-Kutta longitudinal push, second
+    // transverse half step. Returns false without touching the GPU state if the
+    // step needs something that is not ported yet (a chicane or a corrector),
+    // in which case the caller must fall back to the CPU.
+    bool beamStep(Beam *beam, Undulator *und, std::vector<Field *> *field,
+                  double delz, std::string &reason);
 
     // Largest relative difference between the host arrays and the resident GPU
     // copy, without modifying either. Checks the marshalling in isolation; both

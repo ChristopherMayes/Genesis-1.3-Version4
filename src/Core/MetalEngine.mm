@@ -206,13 +206,191 @@ kernel void deposit(device atomic_float* src [[buffer(0)]],
     atomic_fetch_add_explicit(&src[d  ], w*vr, memory_order_relaxed);
     atomic_fetch_add_explicit(&src[d+1], w*vi, memory_order_relaxed);
 }
+
+// ---------------- transverse tracking ----------------
+
+struct TrkPar {
+    float delz, aw, qx, qy, xoff, yoff, gref;
+    uint  mx, my;          // 0 = drift, 1 = focusing, 2 = defocusing
+};
+
+kernel void track_beam(device float* X  [[buffer(0)]], device float* Y  [[buffer(1)]],
+                       device float* PX [[buffer(2)]], device float* PY [[buffer(3)]],
+                       const device float* G [[buffer(4)]],
+                       constant TrkPar& P [[buffer(5)]],
+                       uint gid [[thread_position_in_grid]]){
+    float gam = P.gref + G[gid];
+    float px = PX[gid], py = PY[gid];
+    // gamma*beta_z. Written as gamma*sqrt(1-r) rather than
+    // sqrt(gamma^2-1-aw^2-p^2): at gamma = 11357 the FP32 quantum of gamma^2 is
+    // 15, so the O(1) terms would be lost completely in the subtraction.
+    float r  = (1.0f + P.aw*P.aw + px*px + py*py)/(gam*gam);
+    float gz = gam*sqrt(max(0.0f, 1.0f - r));
+
+    float x = X[gid], y = Y[gid];
+    if (P.mx == 0u) {
+        x += px*P.delz/gz;
+    } else {
+        float foc = sqrt(fabs(P.qx)/gz), omg = foc*P.delz;
+        float a1, a2, a3;
+        if (P.mx == 1u) { a1 = cos(omg);  a2 = sin(omg)/foc;  a3 = -a2*foc*foc; }
+        else            { a1 = cosh(omg); a2 = sinh(omg)/foc; a3 =  a2*foc*foc; }
+        float xt = x - P.xoff;
+        x  = a1*xt + a2*px/gz + P.xoff;
+        px = a3*xt*gz + a1*px;
+    }
+    if (P.my == 0u) {
+        y += py*P.delz/gz;
+    } else {
+        float foc = sqrt(fabs(P.qy)/gz), omg = foc*P.delz;
+        float a1, a2, a3;
+        if (P.my == 1u) { a1 = cos(omg);  a2 = sin(omg)/foc;  a3 = -a2*foc*foc; }
+        else            { a1 = cosh(omg); a2 = sinh(omg)/foc; a3 =  a2*foc*foc; }
+        float yt = y - P.yoff;
+        y  = a1*yt + a2*py/gz + P.yoff;
+        py = a3*yt*gz + a1*py;
+    }
+    X[gid] = x; PX[gid] = px;
+    Y[gid] = y; PY[gid] = py;
+}
+
+// ---------------- longitudinal push ----------------
+
+constant uint MAXH = 4;
+
+struct PushPar {
+    float delz, aw, xks, xku, gref, autophase;
+    float ax, ay, kx, ky, gradx, grady;
+    float gridmax, dgrid;
+    uint  ngrid, npart, nslice, nfld;
+    float rtmp[MAXH];      // und->fc(harm) / field->xks
+    float rharm[MAXH];
+    uint  first[MAXH];
+    uint  onGrid[MAXH];    // filled by the host; 1 if this harmonic is bound
+};
+
+// The ODE is evaluated entirely in FP32, which forces two reformulations.
+//
+// 1. gamma is carried as an offset dg from a reference gref, because at
+//    gamma = 11357 the FP32 quantum of absolute gamma (1.35e-3) is larger than
+//    the per-step energy change (3.0e-4 at saturation, 5.5e-7 at seed).
+//
+// 2. The literal expression for the detuning,
+//        k2pp = xks*(1 - 1/sqrt(1-u)) + xku,
+//    is catastrophic in FP32: u = btper0/gamma^2 is 1.3e-8, below the FP32
+//    epsilon of 1.2e-7, so (1-u) rounds to exactly 1 and the detuning collapses
+//    to zero. The series 1 - 1/sqrt(1-u) = -(u/2)(1 + 3u/4) never forms (1-u)
+//    and is accurate to ~5e-5 rad/m, against a physical detuning spread of
+//    7.4e-2 rad/m for delgam = 1.
+struct Acc { float gg, pp; };
+
+inline Acc ode(float dg, float th, float btpar, float ez,
+               thread const float2* rpart, constant PushPar& P, Acc k){
+    float2 ctmp = float2(0.0f);
+    for (uint i = 0; i < P.nfld; i++) {
+        float a = P.rharm[i]*th;
+        float2 e = float2(cos(a), -sin(a));
+        ctmp += float2(rpart[i].x*e.x - rpart[i].y*e.y,
+                       rpart[i].x*e.y + rpart[i].y*e.x);
+    }
+    float tgam   = P.gref + dg;
+    float btper0 = btpar - (2.0f/P.xks)*ctmp.x;
+    float u      = btper0/(tgam*tgam);
+    float invb   = 1.0f + 0.5f*u + 0.375f*u*u;          // 1/sqrt(1-u)
+    k.pp += -P.xks*0.5f*u*(1.0f + 0.75f*u) + P.xku;     // dtheta/dz
+    k.gg += ctmp.y*invb/tgam - ez;                      // dgamma/dz
+    return k;
+}
+
+kernel void push_beam(device float* G  [[buffer(0)]], device float* TH [[buffer(1)]],
+                      const device float* X [[buffer(2)]], const device float* Y [[buffer(3)]],
+                      const device float* PX [[buffer(4)]], const device float* PY [[buffer(5)]],
+                      const device float* EZ [[buffer(6)]],
+                      constant PushPar& P [[buffer(7)]],
+                      const device float2* F0 [[buffer(8)]],
+                      const device float2* F1 [[buffer(9)]],
+                      const device float2* F2 [[buffer(10)]],
+                      const device float2* F3 [[buffer(11)]],
+                      uint gid [[thread_position_in_grid]]){
+    uint is = gid / P.npart;
+
+    float x = X[gid], y = Y[gid], px = PX[gid], py = PY[gid];
+    float dx = x - P.ax, dy = y - P.ay;
+    float awloc = 1.0f + 0.5f*(P.kx*dx*dx + P.ky*dy*dy) + P.gradx*dx + P.grady*dy;
+    float btpar = 1.0f + px*px + py*py + P.aw*P.aw*awloc*awloc;
+    float ez = EZ[is];
+
+    // Bilinear gather of each harmonic at the particle position.
+    float2 rpart[MAXH];
+    for (uint i = 0; i < MAXH; i++) rpart[i] = float2(0.0f);
+
+    bool on = (x > -P.gridmax && x < P.gridmax && y > -P.gridmax && y < P.gridmax);
+    if (on) {
+        float wx = (x + P.gridmax)/P.dgrid, wy = (y + P.gridmax)/P.dgrid;
+        float fx = floor(wx), fy = floor(wy);
+        wx = 1.0f + fx - wx;
+        wy = 1.0f + fy - wy;
+        uint c = uint(fx) + uint(fy)*P.ngrid;
+        for (uint i = 0; i < P.nfld; i++) {
+            const device float2* F = (i==0u)?F0:((i==1u)?F1:((i==2u)?F2:F3));
+            uint b = ((is + P.first[i]) % P.nslice)*(P.ngrid*P.ngrid) + c;
+            float2 cp = F[b           ]*(wx*wy)
+                      + F[b+1u        ]*((1.0f-wx)*wy)
+                      + F[b+P.ngrid   ]*(wx*(1.0f-wy))
+                      + F[b+P.ngrid+1u]*((1.0f-wx)*(1.0f-wy));
+            // rtmp*awloc*conj(cpart)
+            float s = P.rtmp[i]*awloc;
+            rpart[i] = float2(s*cp.x, -s*cp.y);
+        }
+    }
+
+    float dg = G[gid], th = TH[gid] + P.autophase;
+
+    // Classic RK4, transcribed from BeamSolver::RungeKutta.
+    Acc k2 = ode(dg, th, btpar, ez, rpart, P, Acc{0.0f, 0.0f});
+    float stpz = 0.5f*P.delz;
+    dg += stpz*k2.gg;  th += stpz*k2.pp;
+    Acc k3 = k2;
+    k2 = ode(dg, th, btpar, ez, rpart, P, Acc{0.0f, 0.0f});
+    dg += stpz*(k2.gg - k3.gg);  th += stpz*(k2.pp - k3.pp);
+    k3.gg /= 6.0f; k3.pp /= 6.0f;
+    k2.gg *= -0.5f; k2.pp *= -0.5f;
+    k2 = ode(dg, th, btpar, ez, rpart, P, k2);
+    stpz = P.delz;
+    dg += stpz*k2.gg;  th += stpz*k2.pp;
+    k3.gg -= k2.gg; k3.pp -= k2.pp;
+    k2.gg *= 2.0f;  k2.pp *= 2.0f;
+    k2 = ode(dg, th, btpar, ez, rpart, P, k2);
+    dg += stpz*(k3.gg + k2.gg/6.0f);
+    th += stpz*(k3.pp + k2.pp/6.0f);
+
+    G[gid] = dg; TH[gid] = th;
+}
 )MSL";
 
-// Mirrors the MSL struct above.
+// Mirrors the MSL structs above.
 struct DepPar {
     float gridmax, dgrid, gref, scl;
     float ax, ay, kx, ky, gradx, grady;
     uint32_t ngrid, npart, nslice, harm, first;
+};
+
+struct TrkPar {
+    float delz, aw, qx, qy, xoff, yoff, gref;
+    uint32_t mx, my;
+};
+
+enum { kMaxHarm = 4 };
+
+struct PushPar {
+    float delz, aw, xks, xku, gref, autophase;
+    float ax, ay, kx, ky, gradx, grady;
+    float gridmax, dgrid;
+    uint32_t ngrid, npart, nslice, nfld;
+    float rtmp[kMaxHarm];
+    float rharm[kMaxHarm];
+    uint32_t first[kMaxHarm];
+    uint32_t onGrid[kMaxHarm];
 };
 
 struct MetalEngine::Impl {
@@ -239,10 +417,11 @@ struct MetalEngine::Impl {
     // delz changes.
     id<MTLBuffer> bSrc {nil};
     id<MTLBuffer> bW {nil};
+    id<MTLBuffer> bEZ {nil};
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
-    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA;
+    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA, pTrk, pPush;
 
     size_t bytes {0};
 
@@ -324,6 +503,14 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         return false;
     }
 
+    if (field->size() > static_cast<size_t>(kMaxHarm)) {
+        std::ostringstream os;
+        os << field->size() << " field harmonics; the kernels support at most "
+           << kMaxHarm;
+        reason = os.str();
+        return false;
+    }
+
     for (size_t i = 0; i < field->size(); i++) {
         Field *f = field->at(i);
         if (static_cast<int>(f->field.size()) != p_->nslice) {
@@ -339,6 +526,13 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
             os << "ngrid = " << f->ngrid
                << ": the Metal field solver currently implements only ngrid = 256";
             reason = os.str();
+            return false;
+        }
+        // The push kernel gathers every harmonic at one set of bilinear
+        // weights, so all harmonics must share a grid.
+        if (f->ngrid != field->at(0)->ngrid || f->dgrid != field->at(0)->dgrid ||
+            f->gridmax != field->at(0)->gridmax) {
+            reason = "field harmonics do not share the same transverse grid";
             return false;
         }
     }
@@ -394,6 +588,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     const size_t nn = static_cast<size_t>(ng) * ng;
     p_->bSrc = alloc(static_cast<size_t>(p_->nslice) * nn * 2 * sizeof(float));
     p_->bW = alloc(static_cast<size_t>(ng) * 2 * sizeof(float));
+    p_->bEZ = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
     p_->bExpK.clear();
     p_->delzCached.assign(field->size(), -1.0);
     for (size_t i = 0; i < field->size(); i++) {
@@ -436,6 +631,8 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pRowM = pso(@"r16_rows_mul");
     p_->pCol = pso(@"r16_cols");
     p_->pColA = pso(@"r16_cols_add");
+    p_->pTrk = pso(@"track_beam");
+    p_->pPush = pso(@"push_beam");
     if (!ok) {
         reason = "compute pipeline creation failed";
         return false;
@@ -564,6 +761,158 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
     }
 }
 
+bool MetalEngine::beamStep(Beam *beam, Undulator *und,
+                           std::vector<Field *> *field, double delz,
+                           std::string &reason)
+{
+    // Everything Beam::track does that is not yet on the GPU has to be
+    // inactive, otherwise the answer would silently differ from the CPU.
+    double angle, lb, ld, lt, cx, cy;
+    und->getChicaneParameters(&angle, &lb, &ld, &lt);
+    und->getCorrectorParameters(&cx, &cy);
+    if (angle != 0) {
+        reason = "chicane";
+        return false;
+    }
+    if (cx != 0 || cy != 0) {
+        reason = "corrector";
+        return false;
+    }
+
+    @autoreleasepool {
+        const int istep = und->getStep();
+        const int ns = p_->nslice;
+        const size_t nthread = static_cast<size_t>(ns) * p_->npart;
+        const MTLSize grid = MTLSizeMake(nthread, 1, 1);
+        const MTLSize tg = MTLSizeMake(256, 1, 1);
+
+        // Transverse optics, transcribed from TrackBeam::track.
+        double aw, dax, day, ku, kx, ky, qf, dqx, dqy;
+        und->getUndulatorParameters(&aw, &dax, &day, &ku, &kx, &ky);
+        und->getQuadrupoleParameters(&qf, &dqx, &dqy);
+        const double gamma0 = und->getGammaRef();
+        const double betpar0 = sqrt(1 - (1 + aw * aw) / gamma0 / gamma0);
+        const double qquad = qf * gamma0;
+        const double qnatx = kx * aw * aw / gamma0 / betpar0;
+        const double qnaty = ky * aw * aw / gamma0 / betpar0;
+
+        TrkPar T;
+        const double qx = qquad + qnatx;
+        const double qy = -qquad + qnaty;
+        double xoff = qquad * dqx + qnatx * dax;
+        double yoff = -qquad * dqy + qnaty * day;
+        T.mx = (qx == 0) ? 0 : (qx > 0 ? 1 : 2);
+        T.my = (qy == 0) ? 0 : (qy > 0 ? 1 : 2);
+        if (qx != 0) {
+            xoff /= qx;
+        }
+        if (qy != 0) {
+            yoff /= qy;
+        }
+        T.aw = static_cast<float>(aw);
+        T.qx = static_cast<float>(qx);
+        T.qy = static_cast<float>(qy);
+        T.xoff = static_cast<float>(xoff);
+        T.yoff = static_cast<float>(yoff);
+        T.gref = static_cast<float>(p_->gref);
+        T.delz = static_cast<float>(0.5 * delz);
+
+        // Longitudinal push. Note that the undulator parameters used here are
+        // the raw lattice values, not the ones zeroed outside an undulator that
+        // TrackBeam uses -- this mirrors BeamSolver::advance.
+        PushPar P;
+        P.delz = static_cast<float>(delz);
+        P.aw = static_cast<float>(und->getaw());
+        P.gref = static_cast<float>(p_->gref);
+        P.autophase = static_cast<float>(und->autophase());
+        P.ax = static_cast<float>(und->ax[istep]);
+        P.ay = static_cast<float>(und->ay[istep]);
+        P.kx = static_cast<float>(und->kx[istep]);
+        P.ky = static_cast<float>(und->ky[istep]);
+        P.gradx = static_cast<float>(und->gradx[istep]);
+        P.grady = static_cast<float>(und->grady[istep]);
+        P.gridmax = static_cast<float>(field->at(0)->gridmax);
+        P.dgrid = static_cast<float>(field->at(0)->dgrid);
+        P.ngrid = static_cast<uint32_t>(p_->ngrid[0]);
+        P.npart = static_cast<uint32_t>(p_->npart);
+        P.nslice = static_cast<uint32_t>(ns);
+        P.nfld = static_cast<uint32_t>(field->size());
+
+        double xks = 1;
+        for (size_t i = 0; i < field->size(); i++) {
+            Field *f = field->at(i);
+            const int harm = f->getHarm();
+            xks = f->xks / static_cast<double>(harm);
+            P.rtmp[i] = static_cast<float>(und->fc(harm) / f->xks);
+            P.rharm[i] = static_cast<float>(harm);
+            P.first[i] = static_cast<uint32_t>(f->first);
+            P.onGrid[i] = 1;
+        }
+        for (size_t i = field->size(); i < kMaxHarm; i++) {
+            P.rtmp[i] = 0;
+            P.rharm[i] = 0;
+            P.first[i] = 0;
+            P.onGrid[i] = 0;
+        }
+        P.xks = static_cast<float>(xks);
+        double xku = und->getku();
+        if (xku == 0) {
+            // In a drift a particle at the reference energy stays in phase.
+            xku = xks * 0.5 / gamma0 / gamma0;
+        }
+        P.xku = static_cast<float>(xku);
+
+        // Long-range space charge, in units of the electron rest mass. Zero
+        // unless the space-charge solver is switched on.
+        float *ez = (float *)[p_->bEZ contents];
+        for (int is = 0; is < ns; is++) {
+            ez[is] = (is < static_cast<int>(beam->longESC.size()))
+                         ? static_cast<float>(-beam->longESC[is] / 511000.0)
+                         : 0.0f;
+        }
+
+        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+
+        auto encTrack = [&]() {
+            [e setComputePipelineState:p_->pTrk];
+            [e setBuffer:p_->bX offset:0 atIndex:0];
+            [e setBuffer:p_->bY offset:0 atIndex:1];
+            [e setBuffer:p_->bPX offset:0 atIndex:2];
+            [e setBuffer:p_->bPY offset:0 atIndex:3];
+            [e setBuffer:p_->bG offset:0 atIndex:4];
+            [e setBytes:&T length:sizeof(T) atIndex:5];
+            [e dispatchThreads:grid threadsPerThreadgroup:tg];
+        };
+
+        encTrack();   // first half step
+
+        [e setComputePipelineState:p_->pPush];
+        [e setBuffer:p_->bG offset:0 atIndex:0];
+        [e setBuffer:p_->bT offset:0 atIndex:1];
+        [e setBuffer:p_->bX offset:0 atIndex:2];
+        [e setBuffer:p_->bY offset:0 atIndex:3];
+        [e setBuffer:p_->bPX offset:0 atIndex:4];
+        [e setBuffer:p_->bPY offset:0 atIndex:5];
+        [e setBuffer:p_->bEZ offset:0 atIndex:6];
+        [e setBytes:&P length:sizeof(P) atIndex:7];
+        for (int i = 0; i < kMaxHarm; i++) {
+            const size_t k = (i < static_cast<int>(p_->bField.size()))
+                                 ? static_cast<size_t>(i)
+                                 : 0;
+            [e setBuffer:p_->bField[k] offset:0 atIndex:8 + i];
+        }
+        [e dispatchThreads:grid threadsPerThreadgroup:tg];
+
+        encTrack();   // second half step
+
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    return true;
+}
+
 void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
 {
     const int ns = p_->nslice, np = p_->npart;
@@ -648,6 +997,27 @@ void MetalEngine::downloadField(std::vector<Field *> *field)
             for (size_t k = 0; k < nn; k++) {
                 dst[k] = std::complex<double>(s[k]);
             }
+        }
+    }
+}
+
+void MetalEngine::downloadBeam(Beam *beam)
+{
+    const int ns = p_->nslice, np = p_->npart;
+    const float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
+    const float *g = p_->fg(), *t = p_->ft();
+    const double gref = p_->gref;
+
+    for (int is = 0; is < ns; is++) {
+        const size_t o = static_cast<size_t>(is) * np;
+        Particle *dst = beam->beam[is].data();
+        for (int ip = 0; ip < np; ip++) {
+            dst[ip].x = x[o + ip];
+            dst[ip].y = y[o + ip];
+            dst[ip].px = px[o + ip];
+            dst[ip].py = py[o + ip];
+            dst[ip].gamma = gref + static_cast<double>(g[o + ip]);
+            dst[ip].theta = t[o + ip];
         }
     }
 }

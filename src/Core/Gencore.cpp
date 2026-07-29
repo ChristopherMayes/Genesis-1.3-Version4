@@ -113,6 +113,8 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     // difference; GENESIS_METAL=2 lets the GPU result drive the simulation.
     bool metalDrive = useMetal && (atoi(metalEnv) >= 2);
     double metalFieldErr = 0;
+    double metalBeamErr = 0;
+    bool metalBeamOK = false;
     int metalSteps = 0;
     if (useMetal) {
         string reason;
@@ -159,7 +161,31 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ---------------------------------------
 	  // step 2 - Advance electron beam
 
+#ifdef G4_METAL
+	  // Same validation pattern as the field solve below: upload the current
+	  // state, run the GPU version, let the CPU do the real step, compare.
+	  if (useMetal) {
+	    string why;
+	    metal.upload(beam, field);
+	    metalBeamOK = metal.beamStep(beam, und, field, delz, why);
+	    if (!metalBeamOK && metalSteps == 0 && rank == 0) {
+	      cout << "  Metal beam step skipped: " << why << endl;
+	    }
+	  }
+#endif
+
 	  beam->track(delz,field,und);
+
+#ifdef G4_METAL
+	  if (useMetal && metalBeamOK) {
+	    MetalEngine::SyncError e = metal.compare(beam, field);
+	    metalBeamErr = max(metalBeamErr, e.beam);
+	    if (metalSteps < 3 && rank == 0) {
+	      cout << "  Metal beam step " << metalSteps << ": rel err " << e.beam << endl;
+	    }
+	    if (metalDrive) { metal.downloadBeam(beam); }
+	  }
+#endif
 
 	  // -----------------------------------------
 	  // step 3 - Beam post processing, e.g. sorting
@@ -231,8 +257,8 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 
 #ifdef G4_METAL
 	if (useMetal && rank == 0) {
-	  cout << "Metal field solve vs CPU over " << metalSteps
-	       << " steps: max relative error " << metalFieldErr << endl;
+	  cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
+	       << metalFieldErr << ", beam " << metalBeamErr << endl;
 	}
 #endif
      
