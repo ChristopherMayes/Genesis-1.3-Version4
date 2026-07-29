@@ -11,7 +11,7 @@
 
 extern bool MPISingle;
 
-bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *und,bool isTime, bool isScan, bool periodic, FilterDiagnostics &filter)
+bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *und,bool isTime, bool isScan, bool periodic, FilterDiagnostics &filter, bool gpu, bool gpuValidate)
 {
     // function returns 'true' if everything is ok
 
@@ -102,41 +102,49 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     diag.calc(beam, field, und->getz());  // initial calculation
 
 #ifdef G4_METAL
-    // GPU backend, opt-in while it is being built up. At this stage it only
-    // allocates the resident buffers and checks that the host transfers are
-    // lossless to FP32; the tracking still runs on the CPU below.
-    // TODO: promote the switch to a &track namelist flag once the kernels land.
+    // GPU backend, selected with `gpu = true` in &track. `gpu_validate = true`
+    // additionally runs the CPU path every step and reports the largest
+    // relative difference; that is a testing mode and is much slower than
+    // either path on its own.
     MetalEngine metal;
-    const char *metalEnv = getenv("GENESIS_METAL");
-    bool useMetal = (metalEnv != nullptr);
-    // GENESIS_METAL=1 runs the GPU solve alongside the CPU one and reports the
-    // difference; GENESIS_METAL=2 lets the GPU result drive the simulation.
-    bool metalDrive = useMetal && (atoi(metalEnv) >= 2);
+    bool useMetal = gpu || gpuValidate;
+    bool metalDrive = gpu;              // GPU result is the answer
+    bool metalCompare = gpuValidate;    // also run the CPU and diff
     double metalFieldErr = 0;
     double metalBeamErr = 0;
     bool metalBeamOK = false;
     int metalSteps = 0;
+    int metalFallback = 0;
     if (useMetal) {
         string reason;
         if (!MetalEngine::available()) {
             reason = "no Metal device with unified memory";
-            useMetal = false;
         } else if (!metal.init(beam, field, reason)) {
-            useMetal = false;
-        }
-        if (!useMetal) {
-            if (rank == 0) {
-                cout << "Metal backend not used: " << reason << " - running on CPU" << endl;
-            }
+            // reason set by init()
+        } else if (beam->gpuUnsupportedPhysics(reason)) {
+            reason += " is not implemented on the GPU yet";
         } else {
-            metal.upload(beam, field);
-            MetalEngine::SyncError err = metal.compare(beam, field);
+            reason.clear();
+        }
+        if (!reason.empty()) {
+            // The user asked for the GPU explicitly, so do not quietly fall
+            // back to the CPU and hand back numbers from a different code path.
             if (rank == 0) {
-                cout << "Metal backend: " << MetalEngine::deviceName() << ", "
-                     << metal.bytesResident() / (1024 * 1024) << " MB resident, gamma_ref = "
-                     << metal.gammaRef() << endl;
-                cout << "  host transfer check: field " << err.field
-                     << "   beam " << err.beam << " (relative, FP32 rounding is ~1e-7)" << endl;
+                cout << "*** Error: gpu = true in &track, but " << reason << endl;
+            }
+            return false;
+        }
+        metal.upload(beam, field);
+        MetalEngine::SyncError err = metal.compare(beam, field);
+        if (rank == 0) {
+            cout << "Metal backend: " << MetalEngine::deviceName() << ", "
+                 << metal.bytesResident() / (1024 * 1024) << " MB resident, gamma_ref = "
+                 << metal.gammaRef() << endl;
+            cout << "  host transfer check: field " << err.field
+                 << "   beam " << err.beam << " (relative, FP32 rounding is ~1e-7)" << endl;
+            if (metalCompare) {
+                cout << "  gpu_validate is on: the CPU path runs as well and the "
+                        "difference is reported. This is slow." << endl;
             }
         }
     }
@@ -162,29 +170,35 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // step 2 - Advance electron beam
 
 #ifdef G4_METAL
-	  // Same validation pattern as the field solve below: upload the current
-	  // state, run the GPU version, let the CPU do the real step, compare.
+	  // The upload is still needed every step because the host arrays remain the
+	  // source of truth for diagnostics, slippage and sorting. Removing it is the
+	  // next stage of the port.
 	  if (useMetal) {
 	    string why;
 	    metal.upload(beam, field);
 	    metalBeamOK = metal.beamStep(beam, und, field, delz, why);
-	    if (!metalBeamOK && metalSteps == 0 && rank == 0) {
-	      cout << "  Metal beam step skipped: " << why << endl;
+	    if (!metalBeamOK) {
+	      // Localised elements the GPU does not handle (chicane, corrector).
+	      // Falling back for that step is correct because the host arrays are
+	      // in sync at this point.
+	      if (metalFallback == 0 && rank == 0) {
+		cout << "  Metal: falling back to the CPU for " << why << " steps" << endl;
+	      }
+	      metalFallback++;
 	    }
 	  }
-#endif
-
-	  beam->track(delz,field,und);
-
-#ifdef G4_METAL
+	  if (!metalDrive || !metalBeamOK || metalCompare) {
+	    beam->track(delz,field,und);
+	  }
 	  if (useMetal && metalBeamOK) {
-	    MetalEngine::SyncError e = metal.compare(beam, field);
-	    metalBeamErr = max(metalBeamErr, e.beam);
-	    if (metalSteps < 3 && rank == 0) {
-	      cout << "  Metal beam step " << metalSteps << ": rel err " << e.beam << endl;
+	    if (metalCompare) {
+	      MetalEngine::SyncError e = metal.compare(beam, field);
+	      metalBeamErr = max(metalBeamErr, e.beam);
 	    }
 	    if (metalDrive) { metal.downloadBeam(beam); }
 	  }
+#else
+	  beam->track(delz,field,und);
 #endif
 
 	  // -----------------------------------------
@@ -205,32 +219,26 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // step 4 - Advance radiation field
 
 #ifdef G4_METAL
-	  // Validation stage: run the GPU field solve on a copy of the current
-	  // state, let the CPU do the real step, then compare. The host arrays are
-	  // untouched by this, so the physics is unaffected unless metalDrive is on.
-	  // Marshalling every step makes it slow -- that is expected here,
-	  // residency comes later.
 	  if (useMetal) {
 	    metal.upload(beam, field);
 	    metal.fieldStep(und, field, delz);
 	  }
-#endif
-
-	  for (int i=0; i<field->size();i++){
-	    field->at(i)->track(delz,beam,und);
+	  if (!metalDrive || metalCompare) {
+	    for (int i=0; i<field->size();i++){
+	      field->at(i)->track(delz,beam,und);
+	    }
 	  }
-
-#ifdef G4_METAL
 	  if (useMetal) {
-	    MetalEngine::SyncError e = metal.compare(beam, field);
-	    metalFieldErr = max(metalFieldErr, e.field);
-	    if (metalSteps < 3 && rank == 0) {
-	      cout << "  Metal field step " << metalSteps << ": rel err " << e.field << endl;
+	    if (metalCompare) {
+	      MetalEngine::SyncError e = metal.compare(beam, field);
+	      metalFieldErr = max(metalFieldErr, e.field);
 	    }
 	    metalSteps++;
-	    if (metalDrive) {
-	      metal.downloadField(field);
-	    }
+	    if (metalDrive) { metal.downloadField(field); }
+	  }
+#else
+	  for (int i=0; i<field->size();i++){
+	    field->at(i)->track(delz,beam,und);
 	  }
 #endif
 
@@ -257,8 +265,14 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 
 #ifdef G4_METAL
 	if (useMetal && rank == 0) {
-	  cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
-	       << metalFieldErr << ", beam " << metalBeamErr << endl;
+	  if (metalCompare) {
+	    cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
+		 << metalFieldErr << ", beam " << metalBeamErr << endl;
+	  }
+	  if (metalFallback > 0) {
+	    cout << "Metal: " << metalFallback << " of " << metalSteps
+		 << " steps fell back to the CPU" << endl;
+	  }
 	}
 #endif
      

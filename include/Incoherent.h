@@ -27,6 +27,7 @@ class Incoherent{
    virtual ~Incoherent();
    void init(int, int,bool,bool);
    void apply(Beam *,Undulator *und, double );
+   [[nodiscard]] bool isEnabled() const { return doLoss || doSpread; }
 
  private:
    bool doLoss,doSpread;

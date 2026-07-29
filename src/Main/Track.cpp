@@ -12,6 +12,8 @@ Track::Track()
   exclharm = false;
   fftsolver = false;
   periodic = false;
+  gpu = false;
+  gpuValidate = false;
 }
 
 Track::~Track(){}
@@ -36,6 +38,8 @@ void Track::usage(){
   cout << " double xcut = 1 " << endl;
   cout << " double ycut = 1 " << endl;
   cout << " double sigmoid = 1" << endl;
+  cout << " bool gpu = false" << endl;
+  cout << " bool gpu_validate = false" << endl;
   cout << "&end" << endl << endl;
   /* currently undocumented debugging options: dbg_report_lattice, dbg_suppress_outfile */
 
@@ -94,6 +98,8 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
   if (arg->find("ycut")!=end)     {yc= atof(arg->at("ycut").c_str());  arg->erase(arg->find("ycut"));}
   if (arg->find("sigmoid")!=end)     {sig= atof(arg->at("sigmoid").c_str());  arg->erase(arg->find("sigmoid"));}
   if (arg->find("source_filter")!=end) {doFilter = atob(arg->at("source_filter")); arg->erase(arg->find("source_filter"));}
+  if (arg->find("gpu")!=end) {gpu = atob(arg->at("gpu")); arg->erase(arg->find("gpu"));}
+  if (arg->find("gpu_validate")!=end) {gpuValidate = atob(arg->at("gpu_validate")); arg->erase(arg->find("gpu_validate"));}
   if (arg->size()!=0){
     if (rank==0){ cout << "*** Error: Unknown elements in &track" << endl; this->usage();}
     return false;
@@ -168,7 +174,7 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
 
   // call to gencore to do the actual tracking.  
   Gencore core;
-  if(!core.run(beam,field,setup,und,isTime,isScan, periodic, filter)) {
+  if(!core.run(beam,field,setup,und,isTime,isScan, periodic, filter, gpu, gpuValidate)) {
     /* execution of simulation was not successful, for instance because of IO error during a file write triggered by marker */
     if  (rank==0) { cout << "End of Track (after error)" << endl;}
     delete und;

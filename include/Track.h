@@ -35,6 +35,7 @@ class Track: public StringProcessing{
    int output_step,dumpFieldStep,dumpBeamStep,sort_step,bunchharm;
    int rank, size;
    bool exclharm,fftsolver,doFilter,periodic;
+   bool gpu,gpuValidate;
 };
 
 

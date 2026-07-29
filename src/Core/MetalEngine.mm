@@ -778,6 +778,9 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         reason = "corrector";
         return false;
     }
+    if (beam->gpuUnsupportedPhysics(reason)) {
+        return false;
+    }
 
     @autoreleasepool {
         const int istep = und->getStep();

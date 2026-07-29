@@ -112,6 +112,17 @@ void Beam::track(double delz,vector<Field *> *field, Undulator *und){
   solver.track(delz*0.5,this,und,true);      }
 
 
+// Reports any effect that Beam::track applies but the GPU backend does not yet
+// implement. Used to refuse GPU tracking rather than silently dropping physics.
+bool Beam::gpuUnsupportedPhysics(string &what) const
+{
+  if (incoherent.isEnabled()) { what = "incoherent synchrotron radiation (isr_loss/isr_spread)"; return true; }
+  if (col.hasWakeDefined())   { what = "collective effects / wakefields"; return true; }
+  if (solver.hasShortRangeSC()){ what = "short-range space charge (nz/nphi in &efield)"; return true; }
+  return false;
+}
+
+
 
 void Beam::report_storage(string infotxt)
 {

@@ -30,6 +30,7 @@ public:
     void applyR56(Beam *, Undulator *, double);
     double getSCField(int);
     void checkAllocation(unsigned long i);
+    [[nodiscard]] bool hasShortRangeSC() const { return efield.hasShortRange(); }
 
 private:
     complex<double> cpart;
