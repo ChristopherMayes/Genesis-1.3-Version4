@@ -159,11 +159,11 @@ loop.
 
 | `ngrid` | REGS x LANES | radices used | tracking loop | device busy |
 |---:|---:|---|---:|---:|
-| 64 | 8 x 8 | 8, 8 | 1.01 s | 75% |
-| 128 | 16 x 8 | 16, 8 | 1.70 s | 81% |
-| 256 | 16 x 16 | 16, 16 | 4.13 s | 91% |
-| 512 | 32 x 16 | 32, 16 | 15.8 s | 97% |
-| 1024 | 32 x 32 | 32, 32 | 66.7 s | 99% |
+| 64 | 8 x 8 | 8, 8 | 0.93 s | 82% |
+| 128 | 16 x 8 | 16, 8 | 1.60 s | 85% |
+| 256 | 16 x 16 | 16, 16 | 4.09 s | 92% |
+| 512 | 32 x 16 | 32, 16 | 15.9 s | 98% |
+| 1024 | 32 x 32 | 32, 32 | 67.4 s | 98% |
 
 The SASE example at one rank, on an M3 Max. Each row has four times the grid
 points of the one above, and from 256 upwards each doubling costs about four
@@ -345,15 +345,15 @@ arithmetic is the same.
 
 ```
 amplitudes, relative                         error       scale
-  Field/Global/intensity-farfield       6.616e-04   3.447e+20
-  Field/intensity-farfield              6.532e-04   1.768e+21
+  Field/Global/intensity-farfield       6.614e-04   3.447e+20
+  Field/intensity-farfield              6.533e-04   1.768e+21
   Field/ydivergence                     6.055e-04   1.599e-05
   Field/xdivergence                     4.219e-04   1.590e-05
-  Field/intensity-nearfield             3.948e-04   1.104e+16
-  Beam/bunching                         1.925e-04   1.241e-02
-  Field/power                           1.449e-04   1.338e+07
+  Field/intensity-nearfield             3.950e-04   1.104e+16
+  Beam/bunching                         1.927e-04   1.241e-02
+  Field/power                           1.448e-04   1.338e+07
   Field/xsize                           4.592e-05   7.737e-05
-  worst of 51: 6.616e-04
+  worst of 51: 6.614e-04
 ```
 
 Three things make raw dataset-by-dataset comparison misleading, and
@@ -421,10 +421,9 @@ End-to-end wall clock of `sase_cpu.in` and `sase_gpu.in` — 500 slices,
 
 | ranks | `sase_cpu.in` | `sase_gpu.in` |
 |---:|---:|---:|
-| 1 | 309.1 s | 5.5 s |
+| 1 | 309.1 s | 5.2 s |
 | 2 | 158.5 s | 4.8 s |
 | 4 | 82.1 s | 4.6 s |
-| 8 | 45.9 s | 4.5 s |
 | 12 | 35.2 s | 4.4 s |
 
 About a second of each of those is setup, loading and the output file, on both
@@ -435,7 +434,7 @@ them** — and it leaves the cores free while it works.
 **Measure with a clock, not with `clock()`.** Until recently Genesis' own
 `Total Wall Clock Time` was processor time, not wall clock, which is the same
 thing for a CPU run that never waits and badly wrong for a GPU run that does:
-this deck reported 1.2 s while actually taking 5.5 s, because the waiting costs
+this deck reported 1.2 s while actually taking 5.2 s, because the waiting costs
 no CPU and the shader compile happens in another process. That line is now
 genuine wall clock. Earlier versions of this chapter quoted the old figures and
 so overstated the GPU by about a factor of four; the numbers above supersede
@@ -448,12 +447,33 @@ extra ranks only divide up work they then queue for. Use one rank for a GPU run
 unless the deck needs the memory of several nodes; the earlier advice to use
 four came from the mismeasurement above.
 
-**Where the 4.1 s goes**, for anyone looking to make it smaller: 38% is the
-per-slice diagnostics (`output_step = 100` takes the loop from 4.1 s to 2.6 s),
-6% is the source deposition, and the rest is the four FFT passes, the
+**Where the 4.1 s goes**, for anyone looking to make it smaller: 37% is the
+per-slice diagnostics (`output_step = 100` takes the loop from 4.04 s to
+2.53 s), 6% is the source deposition, and the rest is the four FFT passes, the
 Runge-Kutta push and the transverse map. The field solve runs at close to the
 memory bandwidth of the machine, so the diagnostics are where the remaining
 headroom is, and `output_step` is the knob that costs nothing to turn.
+
+**A small deck is a different problem, and used to be a bad one.** The 500-slice
+example does 19 ms of real work per step, so what it costs to hand work to the
+device does not matter. A steady-state deck is one slice, a few tens of
+microseconds of arithmetic, and there the handover was everything: the engine
+now encodes a whole step into one command buffer and submits once, where it used
+to submit four times and wait four times. On the 1104-step `validate.in` geometry
+without `gpu_validate`:
+
+| | before | after |
+|---|---:|---:|
+| tracking loop | 3.91 s | 1.08 s |
+| device busy | 2.62 s | 0.54 s |
+
+The same deck takes 3.75 s on one CPU core, so a steady-state run went from
+marginally slower than the CPU to three times faster. That the device busy time
+fell by as much as the wall clock is the point: most of what Metal was
+attributing to the device was the cost of starting work, not of doing it. The
+remaining floor is about 1 ms per step, half of it device time for the fifteen
+or so dispatches a step encodes, so the next thing to try for small decks is
+fewer dispatches rather than faster ones.
 
 **One fallback step costs more than it looks.** A step the GPU refuses is not
 merely a step taken at CPU speed: the particles and the field have to come back
@@ -489,11 +509,12 @@ GPU run — loading, shader compile, output file — is about 1 s, against about
 transforms with `FFTW_MEASURE`. Neither is worth optimising unless the tracking
 loop is shorter than either.
 
-**`output_step` matters much less than it used to.** The per-slice diagnostics
-are computed on the GPU, by one threadgroup per slice, so `output_step = 1`
-costs very little: 1.57 s against 1.45 s at `output_step = 100` for this deck.
-That was not true before the host-side diagnostic assembly was fixed, when the
-same pair was 7.33 s and 1.48 s.
+**`output_step` is the one free knob.** The per-slice diagnostics are reduced on
+the GPU, by one threadgroup per slice, and they are still 37% of the tracking
+loop at `output_step = 1`: 4.04 s against 2.53 s at `output_step = 100` on this
+deck. Most of that is the far-field branch, which transforms every slice again.
+An earlier version of this chapter said the difference was 1.57 s against
+1.45 s; that pair came from the timer that did not count waiting.
 
 ## Where the code lives, and adding another backend
 

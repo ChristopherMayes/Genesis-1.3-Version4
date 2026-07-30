@@ -180,10 +180,21 @@ Two lessons about the harness itself are worth keeping:
       question of the tiled deposition: it cannot repay a threadgroup accumulation and the
       `ngrid % 32` constraint that comes with it, whatever a microbenchmark of the kernel alone
       says. The atomics version stays.
-- [ ] `fieldStep`, `beamStep` and each `fieldMoments` call commit their own command buffer and
-      wait. At 92% device busy this costs little on a 500-slice deck, but on a small one it is
-      most of the time (`validate.in` runs at 16% busy). Merging a step into one command buffer
-      would help those, and needs double-buffering of the small host-written arrays.
+- [x] **One command buffer per step instead of four.** `fieldStep`, `beamStep` and each
+      `fieldMoments` call used to commit and wait on their own. On a 500-slice deck that is
+      2%, because a step is 19 ms of real work; on a steady-state deck, where a step is one
+      slice, it was the entire cost. The engine now keeps one encoder open and drains it only
+      when the host has to look at a buffer, which needs no double buffering precisely because
+      nothing is ever in flight while the host is reading: the head of the beam step drains it
+      before overwriting the per-slice arrays. A 1104-step steady-state deck went from 3.91 s
+      to 1.09 s, against 3.60 s on the CPU — from marginally slower than the CPU to three
+      times faster. Device busy time fell from 2.62 s to 0.57 s, which says most of what was
+      being counted as device time was submission overhead.
+- [ ] The remaining per-step floor on a one-slice deck is about 0.99 ms, of which 0.51 ms is
+      device time for around fifteen dispatches. That is dispatch overhead rather than
+      arithmetic, so the next thing worth trying for small decks is fewer dispatches — the
+      zero and deposit passes could be one kernel, and the field solve's four passes are only
+      separable because a 256x256 slice does not fit in threadgroup memory.
 
 ### Constraints that must not be forgotten
 

@@ -53,7 +53,7 @@ Wall clock end to end on an M3 Max (12 performance cores, 40-core GPU):
 
 | ranks | `sase_cpu.in` | `sase_gpu.in` |
 |---:|---:|---:|
-| 1 | 309.1 s | 5.5 s |
+| 1 | 309.1 s | 5.2 s |
 | 4 | 82.1 s | 4.6 s |
 | 12 | 35.2 s | 4.4 s |
 
@@ -61,6 +61,10 @@ So the GPU is worth about 8x all twelve cores and about 75x one of them, on the
 tracking loop alone. **Extra MPI ranks do not help a GPU run**: the line printed
 at the end of the run reports the device already 92% busy at one rank, so the
 ranks only divide up work they then queue for.
+
+A steady-state deck is worth trying too, since that is where an interactive
+parameter scan usually lives. `validate.in` with `gpu_validate` switched off is
+one slice over 1104 steps: 1.17 s on the GPU against 3.75 s on one CPU core.
 
 `export FI_PROVIDER=tcp` is not optional. Conda's MPICH busy-polls while it
 waits, and the faster the compute the more of the machine that wastes: a factor
