@@ -244,12 +244,12 @@ case("two_track_blocks", edit={"track.zstop": 5},
           "zstop = 10\n&end\n")
 case("output_step_5", edit={"track.output_step": 5})
 
-# -- the CPU fallback path --------------------------------------------------
-case("chicane", lat=LAT_CHICANE, expect="fallback")
-
-# The corrector kick runs on the GPU, so this case has to stay on it for every
-# step. It is kept next to the chicane because the two elements enter the step
-# through the same branch of TrackBeam::track.
+# -- localised elements that used to fall back to the CPU --------------------
+# Both run on the GPU now, so both have to stay on it for every step. They are
+# kept together because they enter the step through the same branch of
+# TrackBeam::track, the chicane on the opening half step and the corrector on
+# the closing one.
+case("chicane", lat=LAT_CHICANE)
 case("corrector", lat=LAT_CORRECTOR)
 
 # -- time dependent ---------------------------------------------------------
@@ -316,6 +316,12 @@ case("run_ngrid_1024", tier="run",
      edit={"field.ngrid": 1024, "setup.npart": 131072})
 e, kw = td()
 case("run_time_saturation", tier="run", edit=dict(e, **{"track.zstop": 40}), **kw)
+# The chicane writes the resident particle phases through the R56 shear, and it
+# does so once rather than on every step, which is the pattern the step tier is
+# least able to police: it resynchronises either side of every step, so a phase
+# written to the wrong copy would be repaired before it could be seen.
+case("run_chicane", tier="run", lat=LAT_CHICANE)
+case("run_corrector", tier="run", lat=LAT_CORRECTOR)
 
 
 # --------------------------------------------------------------------------

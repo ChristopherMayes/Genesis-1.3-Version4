@@ -71,8 +71,8 @@ class MetalEngine {
 
     // Beam step: transverse half step, Runge-Kutta longitudinal push, second
     // transverse half step. Returns false without touching the GPU state if the
-    // step needs something that is not ported yet (a chicane), in which case
-    // the caller must fall back to the CPU.
+    // step needs something that is not ported yet, in which case the caller
+    // must fall back to the CPU. No lattice element does that at present.
     bool beamStep(Beam *beam, Undulator *und, std::vector<Field *> *field,
                   double delz, std::string &reason);
 

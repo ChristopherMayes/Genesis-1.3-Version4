@@ -130,6 +130,30 @@ void TrackBeam::applyCorrector(Beam *beam, double cx, double cy)
 
 void TrackBeam::applyChicane(Beam *beam, double angle, double lb, double ld, double lt, double gamma0)
 { 
+  double m[4][4];
+  TrackBeam::chicaneMatrix(angle,lb,ld,lt,m);
+
+  for (int i=0; i<beam->beam.size();i++){
+    for (int j=0; j<beam->beam.at(i).size();j++){
+      Particle *p=&beam->beam.at(i).at(j);
+      double gammaz=sqrt(p->gamma*p->gamma-1- p->px*p->px - p->py*p->py); // = gamma*betaz=gamma*(1-(1+aw*aw)/gamma^2);
+
+      double tmp=p->x;
+      p->x =m[0][0]*tmp        +m[0][1]*p->px/gammaz;
+      p->px=m[1][0]*tmp*gammaz +m[1][1]*p->px;
+      tmp=p->y;
+      p->y =m[2][2]*tmp        +m[2][3]*p->py/gammaz;
+      p->py=m[3][2]*tmp*gammaz +m[3][3]*p->py;
+      
+    }
+  }
+
+  return;
+}
+
+
+void TrackBeam::chicaneMatrix(double angle, double lb, double ld, double lt, double m[][4])
+{ 
   // the tracking is done my applying the transfer matrix for the chicane and  backtracking for a drift over the length of the chicane
   // the effect of the R56 is applied here to the particle phase.  Then the normal tracking should do the momentum dependent change in the 
   // longitudinal position
@@ -138,7 +162,6 @@ void TrackBeam::applyChicane(Beam *beam, double angle, double lb, double ld, dou
   //  m -> bp -> ep -> d1 -> en -> bn -> d2 -> bn -> en-> d1 -> ep-> bp ->d3
   
 
-  double m[4][4];
   double d1[4][4];
   double d2[4][4];
   double d3[4][4];
@@ -196,17 +219,17 @@ void TrackBeam::applyChicane(Beam *beam, double angle, double lb, double ld, dou
   en[3][2]=efoc*-1;
 
 
-  this->matmul(m,bp);
-  this->matmul(m,ep);  
-  this->matmul(m,d1);
-  this->matmul(m,en);
-  this->matmul(m,bn);
-  this->matmul(m,d2);
-  this->matmul(m,bn);
-  this->matmul(m,en);
-  this->matmul(m,d1);
-  this->matmul(m,ep);
-  this->matmul(m,bp);
+  matmul(m,bp);
+  matmul(m,ep);  
+  matmul(m,d1);
+  matmul(m,en);
+  matmul(m,bn);
+  matmul(m,d2);
+  matmul(m,bn);
+  matmul(m,en);
+  matmul(m,d1);
+  matmul(m,ep);
+  matmul(m,bp);
 
   // transport matrix has been cross checked with Madx.  
   /*
@@ -217,23 +240,8 @@ void TrackBeam::applyChicane(Beam *beam, double angle, double lb, double ld, dou
   cout << m[3][2] << " " << m[3][3] << endl;
   */
 
-  this->matmul(m,d3);  // transport backwards because the main tracking still has to do the drift
+  matmul(m,d3);  // transport backwards because the main tracking still has to do the drift
   
-
-  for (int i=0; i<beam->beam.size();i++){
-    for (int j=0; j<beam->beam.at(i).size();j++){
-      Particle *p=&beam->beam.at(i).at(j);
-      double gammaz=sqrt(p->gamma*p->gamma-1- p->px*p->px - p->py*p->py); // = gamma*betaz=gamma*(1-(1+aw*aw)/gamma^2);
-
-      double tmp=p->x;
-      p->x =m[0][0]*tmp        +m[0][1]*p->px/gammaz;
-      p->px=m[1][0]*tmp*gammaz +m[1][1]*p->px;
-      tmp=p->y;
-      p->y =m[2][2]*tmp        +m[2][3]*p->py/gammaz;
-      p->py=m[3][2]*tmp*gammaz +m[3][3]*p->py;
-      
-    }
-  }
 
   return;
 }

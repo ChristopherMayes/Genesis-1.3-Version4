@@ -11,6 +11,7 @@
 
 #include "Beam.h"
 #include "Field.h"
+#include "TrackBeam.h"
 #include "Undulator.h"
 
 #import <Metal/Metal.h>
@@ -471,7 +472,9 @@ kernel void deposit(device atomic_float* src [[buffer(0)]],
 struct TrkPar {
     float delz, aw, qx, qy, xoff, yoff, gref;
     float cpx, cpy;        // corrector kick, already scaled by gamma_ref
+    float cm[8];           // chicane map, rows 00 01 10 11 22 23 32 33
     uint  mx, my;          // 0 = drift, 1 = focusing, 2 = defocusing
+    uint  doMap;           // 1 if the chicane map is to be applied
 };
 
 kernel void track_beam(device float* X  [[buffer(0)]], device float* Y  [[buffer(1)]],
@@ -480,17 +483,35 @@ kernel void track_beam(device float* X  [[buffer(0)]], device float* Y  [[buffer
                        constant TrkPar& P [[buffer(5)]],
                        uint gid [[thread_position_in_grid]]){
     float gam = P.gref + G[gid];
+    float x = X[gid], y = Y[gid];
+    float px = PX[gid], py = PY[gid];
+
+    if (P.doMap != 0u) {
+        // TrackBeam::applyChicane. Its gamma*beta_z leaves out aw, because a
+        // chicane sits outside the undulator, so it is formed separately from
+        // the one the transverse map below uses.
+        float rc = (1.0f + px*px + py*py)/(gam*gam);
+        float gc = gam*sqrt(max(0.0f, 1.0f - rc));
+        float t = x;
+        x  = P.cm[0]*t    + P.cm[1]*px/gc;
+        px = P.cm[2]*t*gc + P.cm[3]*px;
+        t  = y;
+        y  = P.cm[4]*t    + P.cm[5]*py/gc;
+        py = P.cm[6]*t*gc + P.cm[7]*py;
+    }
+
     // TrackBeam::applyCorrector runs before the transverse map and therefore
     // before gamma*beta_z is formed, so the kick is added here rather than to
     // the stored momenta afterwards.
-    float px = PX[gid] + P.cpx, py = PY[gid] + P.cpy;
+    px += P.cpx;
+    py += P.cpy;
+
     // gamma*beta_z. Written as gamma*sqrt(1-r) rather than
     // sqrt(gamma^2-1-aw^2-p^2): at gamma = 11357 the FP32 quantum of gamma^2 is
     // 15, so the O(1) terms would be lost completely in the subtraction.
     float r  = (1.0f + P.aw*P.aw + px*px + py*py)/(gam*gam);
     float gz = gam*sqrt(max(0.0f, 1.0f - r));
 
-    float x = X[gid], y = Y[gid];
     if (P.mx == 0u) {
         x += px*P.delz/gz;
     } else {
@@ -643,6 +664,18 @@ kernel void apply_eloss(device float* G [[buffer(0)]],
 {
     G[gid] += DG[gid/npart];
 }
+
+// Longitudinal phase shift through a chicane, TrackBeam::applyR56. P.x is R56
+// already scaled by 2*pi/(lambda*gamma_ref); P.y is the difference between the
+// energy the offsets are stored against and the lattice reference energy, so
+// that G + P.y is the same gamma - gamma_ref the CPU path forms.
+kernel void apply_r56(device float* TH [[buffer(0)]],
+                      const device float* G [[buffer(1)]],
+                      constant float2& P [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]])
+{
+    TH[gid] += P.x*(G[gid] + P.y);
+}
 )MSL";
 
 // Mirrors the MSL structs above.
@@ -655,7 +688,8 @@ struct DepPar {
 struct TrkPar {
     float delz, aw, qx, qy, xoff, yoff, gref;
     float cpx, cpy;
-    uint32_t mx, my;
+    float cm[8];
+    uint32_t mx, my, doMap;
 };
 
 enum { kMaxHarm = 4 };
@@ -721,7 +755,7 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bFM {nil};
 
     id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA, pTrk, pPush;
-    id<MTLComputePipelineState> pBM, pFM, pCopy, pELoss;
+    id<MTLComputePipelineState> pBM, pFM, pCopy, pELoss, pR56;
 
     size_t bytes {0};
 
@@ -1005,6 +1039,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pFM = pso(@"field_moments");
     p_->pCopy = pso(@"copy_field");
     p_->pELoss = pso(@"apply_eloss");
+    p_->pR56 = pso(@"apply_r56");
     if (!ok) {
         reason = "compute pipeline creation failed";
         return false;
@@ -1142,10 +1177,6 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
     double angle, lb, ld, lt, cx, cy;
     und->getChicaneParameters(&angle, &lb, &ld, &lt);
     und->getCorrectorParameters(&cx, &cy);
-    if (angle != 0) {
-        reason = "chicane";
-        return false;
-    }
     if (beam->gpuUnsupportedPhysics(reason)) {
         return false;
     }
@@ -1187,6 +1218,25 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         T.yoff = static_cast<float>(yoff);
         T.gref = static_cast<float>(p_->gref);
         T.delz = static_cast<float>(0.5 * delz);
+
+        // The chicane map, built by the same code the CPU path uses so that the
+        // two cannot drift apart. It rides the opening half step, which is where
+        // TrackBeam::track calls applyChicane.
+        const uint32_t chicMap = (angle != 0) ? 1u : 0u;
+        T.doMap = 0;
+        for (int i = 0; i < 8; i++) { T.cm[i] = 0; }
+        if (angle != 0) {
+            double m[4][4];
+            TrackBeam::chicaneMatrix(angle, lb, ld, lt, m);
+            T.cm[0] = static_cast<float>(m[0][0]);
+            T.cm[1] = static_cast<float>(m[0][1]);
+            T.cm[2] = static_cast<float>(m[1][0]);
+            T.cm[3] = static_cast<float>(m[1][1]);
+            T.cm[4] = static_cast<float>(m[2][2]);
+            T.cm[5] = static_cast<float>(m[2][3]);
+            T.cm[6] = static_cast<float>(m[3][2]);
+            T.cm[7] = static_cast<float>(m[3][3]);
+        }
 
         // Longitudinal push. Note that the undulator parameters used here are
         // the raw lattice values, not the ones zeroed outside an undulator that
@@ -1261,9 +1311,10 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
 
         // setBytes copies at encode time, so T can be reused for both halves.
-        auto encTrack = [&](double kickx, double kicky) {
+        auto encTrack = [&](double kickx, double kicky, bool map) {
             T.cpx = static_cast<float>(kickx);
             T.cpy = static_cast<float>(kicky);
+            T.doMap = map ? chicMap : 0u;
             [e setComputePipelineState:p_->pTrk];
             [e setBuffer:p_->bX offset:0 atIndex:0];
             [e setBuffer:p_->bY offset:0 atIndex:1];
@@ -1274,7 +1325,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e dispatchThreads:grid threadsPerThreadgroup:tg];
         };
 
-        encTrack(0, 0);   // first half step
+        encTrack(0, 0, true);   // first half step, carrying any chicane
 
         [e setComputePipelineState:p_->pPush];
         [e setBuffer:p_->bG offset:0 atIndex:0];
@@ -1302,9 +1353,25 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e dispatchThreads:grid threadsPerThreadgroup:tg];
         }
 
+        // The R56 phase shift, between the collective kick and the closing half
+        // step, as in Beam::track.
+        if (angle != 0) {
+            const double gamma0lat = und->getGammaRef();
+            double r56 = (4 * lb / sin(angle) * (1 - angle / tan(angle)) +
+                          2 * ld * tan(angle) / cos(angle)) * angle;
+            r56 = r56 * 4 * asin(1.0) / beam->reflength / gamma0lat;
+            const float R[2] = { static_cast<float>(r56),
+                                 static_cast<float>(p_->gref - gamma0lat) };
+            [e setComputePipelineState:p_->pR56];
+            [e setBuffer:p_->bT offset:0 atIndex:0];
+            [e setBuffer:p_->bG offset:0 atIndex:1];
+            [e setBytes:R length:sizeof(R) atIndex:2];
+            [e dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
+
         // TrackBeam::track applies the corrector on the closing half step only,
         // which is why the kick is attached here and not to the opening one.
-        encTrack(cx * gamma0, cy * gamma0);   // second half step
+        encTrack(cx * gamma0, cy * gamma0, false);   // second half step
 
         [e endEncoding];
         [cb commit];

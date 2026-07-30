@@ -31,8 +31,14 @@ class TrackBeam{
    void applyChicane(Beam *, double, double, double, double,double);
    void applyR56(Beam *, Undulator *, double);
 
+   // The chicane transfer matrix, including the backwards drift over the total
+   // length. Static so that a backend which holds the particles elsewhere can
+   // build the same matrix rather than transcribing it.
+   static void chicaneMatrix(double angle, double lb, double ld, double lt,
+                             double m[][4]);
+
  private:
-   void matmul(double a[][4], double b[][4]);
+   static void matmul(double a[][4], double b[][4]);
 };
 
 

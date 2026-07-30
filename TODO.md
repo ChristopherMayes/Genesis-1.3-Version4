@@ -125,9 +125,17 @@ Two lessons about the harness itself are worth keeping:
       cannot hide behind a correct answer. On a 400-slice orbit-error deck at 8 ranks the run
       goes from 25.2 s to 9.4 s against 46.2 s on the CPU, so the speedup over the CPU rises
       from 1.8x to 4.9x. A refused step costs more than a CPU step, because the particles and
-      the field have to make the round trip either side of it. `applyR56` for chicanes is the
-      natural companion and is still outstanding; the `chicane` case is the one remaining
-      fallback, and a lattice holds a handful of chicanes rather than one per step.
+      the field have to make the round trip either side of it.
+- [x] **Port the chicane.** Two pieces: the 4x4 transfer map on the opening half step and the
+      R56 phase shear between the collective kick and the closing one. The matrix is per-step
+      scalars rather than per-particle work, so it is built on the host by
+      `TrackBeam::chicaneMatrix`, which is the CPU path's own construction made static and
+      called from both. Duplicating it would have been the obvious way for the two paths to
+      drift apart later. The map needs its own gamma*beta_z, which leaves out `aw` because a
+      chicane sits outside the undulator. No lattice element falls back to the CPU any more;
+      the machinery is kept for the next unported one. New end-to-end cases `run_chicane` and
+      `run_corrector` cover residency, which the step tier cannot see because it
+      resynchronises either side of every step.
 - [ ] `one4one` is refused outright (the GPU wants a rectangular particle array)
 - [x] Host-side diagnostic assembly. It was ~5 s of the 7.4 s single-rank time. Most of it was
       not `storeValue` at all but `DiagBeamUser::getValues`, which evaluated a `sin`/`cos` per

@@ -117,7 +117,7 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 | `source_filter` | not supported |
 | `one4one` | not supported; the backend wants a rectangular particle array |
 | correctors | supported; the kick rides on the closing half step |
-| chicanes | that one step falls back to the CPU and is reported once |
+| chicanes | supported; the transfer map rides on the opening half step and the R56 shear sits before the closing one |
 | wakefields (`&wake`) | supported, including the resistive wall |
 | ISR, short-range space charge | hard error |
 
@@ -375,8 +375,10 @@ deck spent 187 of its 196 steps that way. On a 400-slice run at eight ranks:
 | GPU, correctors refused | 25.2 s |
 | GPU, correctors ported | 9.4 s |
 
-Correctors now run on the GPU. A chicane is the one element still refused, and
-a lattice normally holds a handful of them rather than one per step.
+No lattice element falls back any more. The machinery is still there, and a
+step that does fall back is still counted and reported at the end of the run,
+but nothing currently triggers it. Everything the backend cannot do is a hard
+error instead.
 
 **`export FI_PROVIDER=tcp` is not optional** if you are using conda's MPICH on
 macOS. The default libfabric provider busy-polls while waiting, and the faster

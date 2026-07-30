@@ -240,7 +240,8 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	    if (!metalDrive || metalCompare) { metal.upload(beam, field); }
 	    metalBeamOK = metal.beamStep(beam, und, field, delz, why);
 	    if (!metalBeamOK) {
-	      // Localised elements the GPU does not handle (a chicane).
+	      // Nothing triggers this today, but the path is kept so that an
+	      // element ported later can be refused rather than dropped.
 	      // Falling back needs the host arrays, so bring them over.
 	      if (metalDrive && !metalCompare) { metal.download(beam, field); }
 	      if (metalFallback == 0 && rank == 0) {
