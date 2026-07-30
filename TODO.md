@@ -1,11 +1,11 @@
 # TODO
 
-## 1. The four upstream pull requests
+## 1. Upstream pull requests
 
-All are open **as drafts** against `svenreiche/Genesis-1.3-Version4`, ready for you to edit and
-then mark ready for review. Take #272 out of draft first — #273's body references it, because
-the three-FFT branch it touches is unreachable without the filter fix. #274 and #275 are
-independent of both and of each other, and can go at any time.
+### Merged
+
+All four are in `svenreiche/Genesis-1.3-Version4` master as of `fc046e3`, and our fork's
+`master` is synced to it.
 
 | PR | branch | commit | title |
 |---|---|---|---|
@@ -14,14 +14,35 @@ independent of both and of each other, and can go at any time.
 | [#274](https://github.com/svenreiche/Genesis-1.3-Version4/pull/274) | `perf/user-diagnostic-guard` | `b815d7a` | Skip the user diagnostic's per-particle work when its output is disabled |
 | [#275](https://github.com/svenreiche/Genesis-1.3-Version4/pull/275) | `fix/lattice-seed-key` | `b997669` | Fix an uncaught exception when `&lattice` sets a seed |
 
-The bodies as submitted are `PR-1-source-filter-fix.md` and `PR-2-fft-two-pass.md`. Edit them on
-GitHub, not here — these files are only the record of what was sent.
+Two consequences for `gpu/metal-engine`, which is still based on v4.6.14: commit `4ef0989`
+duplicates `b997669` exactly, and `959012c` contains `b815d7a` plus changes of its own. A
+rebase onto the new master should drop the first and keep only the `Diagnostic.cpp` half of
+the second.
 
-#275 was built and tested in a worktree at `/tmp/g4seed` (branch off `master`, own `build/`),
-which is still there if Sven asks for changes. The same fix is on `gpu/metal-engine` as
-`4ef0989`, with identical content, so the branches will merge cleanly.
+### Ready to send, branched off the merged master
 
-### Possible fifth report: `transient` in `&wake` appears to do nothing
+| branch | commit | title |
+|---|---|---|
+| `fix/wallclock-timer` | `3d087ed` | Measure the wall clock with a clock |
+| `fix/onaxis-cell-even-ngrid` | `466ed83` | Take the on-axis field diagnostic from the axis when `ngrid` is even |
+
+Both are cherry-picked out of the GPU branch, build clean and are non-GPU. The second is the
+one worth explaining: on a CPU-only build with `ngrid = 256`, `Field/intensity-nearfield`
+peaks at 3.0e15 W/m^2 where the power and spot size imply 1.2e18 on axis — a factor of 400
+low, because the sampled cell is at the edge of the grid. With the fix it reads 1.5e18.
+
+### Not worth sending
+
+The map-lookup hoisting in `DiagBeam::getValues` and `DiagField::getValues` (part of
+`959012c`) is a real speedup on the GPU path, where the reductions are gone and only the
+bookkeeping is left, but not on the CPU path. Measured: the whole diagnostic block is 22% of a
+12-rank CPU run of the SASE example (33.4 s at `output_step = 1` against 26.2 s at 100), and a
+sampling profile puts that time in the `ngrid^2` reduction loops and in FFTW, not in the map
+lookups. Porting it upstream would be churn for something below the noise.
+
+### Still to report: `transient` in `&wake` appears to do nothing
+
+Still true on the merged master (`Collective.cpp`, step 4 of `Collective::update`).
 
 `Collective::update` computes `icut`, the catch-up cut for the transient wake, in step 3, but
 the loop in step 4 starts at `i = 0` and never reads it. Only the commented-out older loop
