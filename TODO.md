@@ -177,7 +177,25 @@ Two lessons about the harness itself are worth keeping:
       during a run. Costs under 3% with `transient = false`. GPU vs CPU at 4 ranks:
       `Beam/energy` 4.0e-10, `Beam/bunching` 3.5e-04, `Field/power` 1.7e-04, against a wake
       effect of 4.0e-05, 8.5e-03 and 2.8e-03 respectively.
-- [ ] Port `Incoherent` and short-range space charge (hard error today)
+- [x] **Port `Incoherent`** — both `doLoss` and `doSpread`. The part worth remembering is the
+      random numbers. `Incoherent::apply` draws once per *beamlet*, not per particle, and the
+      generator is `RandomU`, which is `ran2` from Numerical Recipes: two linear congruential
+      sequences behind a Bays-Durham shuffle table, and a shuffle table has no practical
+      jump-ahead. So a device-side generator cannot reproduce the sequence, only replace it.
+      Rather than accept a different noise realisation on the GPU, the draws are taken on the
+      host in the order the CPU consumes them and uploaded one per beamlet per step, which
+      keeps the ordinary step-tier comparison working: with radiation on, the beam still
+      agrees to 3.2e-06 over 1104 steps, the same as with it off.
+      **The backend needs its own generator, seeded identically, not a shared one.** Under
+      `gpu_validate` both paths run, so a shared generator would hand the first path one set
+      of draws and the second the next set, and the two would disagree by the size of the
+      effect while both were correct.
+      Cost: the loop goes from 4.64 s to 6.43 s on the 500-slice deck with `doSpread`, the
+      device busy time only from 4.32 s to 4.75 s, so the extra 1.5 s is 100 million host
+      draws at about 15 ns each. `doLoss` alone skips the draws entirely, because the spread
+      scales them by zero, and costs 4.96 s. For scale, the radiation itself changes
+      `Field/power` by 25% and `Beam/energyspread` by 8.9%.
+- [ ] Port short-range space charge (hard error today)
 - [x] **Port the corrector kick.** `MetalEngine::beamStep` used to refuse any step with a
       non-zero `cx` or `cy`, and `orbiterror = true` is implemented as a per-step corrector,
       so a deck with undulator orbit errors put 187 of 196 steps back on the CPU and got

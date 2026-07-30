@@ -677,6 +677,26 @@ kernel void apply_eloss(device float* G [[buffer(0)]],
     G[gid] += DG[gid/npart];
 }
 
+// Incoherent synchrotron radiation: the mean energy loss and, if the spread is
+// enabled, a random kick. Both are one number per beamlet rather than per
+// particle, because Incoherent::apply draws once every nbins particles and
+// gives the whole beamlet the same kick, so that the shot noise the beamlet
+// carries is not disturbed.
+//
+// The numbers themselves are drawn on the host from the generator Genesis
+// already uses, in the order the CPU path consumes them, which is what lets a
+// GPU run reproduce a CPU run exactly instead of merely statistically. P is
+// (particles per slice, particles per beamlet).
+kernel void apply_isr(device float* G [[buffer(0)]],
+                      const device float* DG [[buffer(1)]],
+                      constant uint2& P [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]])
+{
+    uint npart = P.x, nbins = P.y;
+    uint nbeamlet = (npart + nbins - 1u)/nbins;
+    G[gid] += DG[(gid/npart)*nbeamlet + (gid % npart)/nbins];
+}
+
 // Longitudinal phase shift through a chicane, TrackBeam::applyR56. P.x is R56
 // already scaled by 2*pi/(lambda*gamma_ref); P.y is the difference between the
 // energy the offsets are stored against and the lattice reference energy, so
@@ -759,6 +779,10 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bW {nil};
     id<MTLBuffer> bEZ {nil};
     id<MTLBuffer> bELoss {nil};
+    id<MTLBuffer> bISR {nil};
+
+    // Beamlet size and count, for the incoherent radiation kick.
+    int nbins {1}, nbeamlet {0};
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
@@ -767,7 +791,7 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bFM {nil};
 
     id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pRowO, pCol, pColA, pTrk, pPush;
-    id<MTLComputePipelineState> pBM, pFM, pELoss, pR56;
+    id<MTLComputePipelineState> pBM, pFM, pELoss, pISR, pR56;
 
     size_t bytes {0};
 
@@ -1047,6 +1071,11 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->bW = alloc(static_cast<size_t>(ng) * 2 * sizeof(float));
     p_->bEZ = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
     p_->bELoss = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
+    // The incoherent kick is one value per beamlet, not per slice, because that
+    // is the granularity Incoherent::apply works at.
+    p_->nbins = (beam->one4one || beam->nbins < 1) ? 1 : beam->nbins;
+    p_->nbeamlet = (p_->npart + p_->nbins - 1) / p_->nbins;
+    p_->bISR = alloc(static_cast<size_t>(p_->nslice) * p_->nbeamlet * sizeof(float));
     p_->bExpK.clear();
     p_->delzCached.assign(field->size(), -1.0);
     for (size_t i = 0; i < field->size(); i++) {
@@ -1114,6 +1143,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pBM = pso(@"beam_moments");
     p_->pFM = pso(@"field_moments");
     p_->pELoss = pso(@"apply_eloss");
+    p_->pISR = pso(@"apply_isr");
     p_->pR56 = pso(@"apply_r56");
     if (!ok) {
         reason = "compute pipeline creation failed";
@@ -1373,6 +1403,22 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
                          : 0.0f;
         }
 
+        // Incoherent synchrotron radiation. One value per beamlet, drawn on the
+        // host from the generator Genesis already uses and in the order the CPU
+        // path consumes them, so that a GPU run reproduces a CPU run rather
+        // than merely agreeing with it in distribution. Beam::track applies this
+        // between the longitudinal push and the wakefield, which is where the
+        // dispatch below sits.
+        std::vector<double> isrKick;
+        const bool haveISR = beam->computeIncoherentKick(und, delz, isrKick);
+        if (haveISR) {
+            const size_t want = static_cast<size_t>(ns) * p_->nbeamlet;
+            float *ik = (float *)[p_->bISR contents];
+            for (size_t k = 0; k < want; k++) {
+                ik[k] = (k < isrKick.size()) ? static_cast<float>(isrKick[k]) : 0.0f;
+            }
+        }
+
         // Wakefields. The loss profile is one number per slice and is built on
         // the host, which is where the current of every slice is reachable
         // through an MPI gather; the GPU only has to add it to the particles.
@@ -1423,6 +1469,18 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e setBuffer:p_->bField[k] offset:0 atIndex:8 + i];
         }
         [e dispatchThreads:grid threadsPerThreadgroup:tg];
+
+        // Incoherent radiation first, then the wake, which is the order
+        // Beam::track applies them in.
+        if (haveISR) {
+            const uint32_t B[2] = { static_cast<uint32_t>(p_->npart),
+                                    static_cast<uint32_t>(p_->nbins) };
+            [e setComputePipelineState:p_->pISR];
+            [e setBuffer:p_->bG offset:0 atIndex:0];
+            [e setBuffer:p_->bISR offset:0 atIndex:1];
+            [e setBytes:B length:sizeof(B) atIndex:2];
+            [e dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
 
         if (haveWake) {
             const uint32_t np = static_cast<uint32_t>(p_->npart);

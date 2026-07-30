@@ -39,6 +39,7 @@ class Beam{
    int  get_WriteFilter_inc();
    bool hasWake();
    bool computeWakeLoss(Undulator *und);
+   bool computeIncoherentKick(Undulator *und, double delz, vector<double> &dg);
    bool gpuUnsupportedPhysics(string &what) const;
    double getSCField(int);
    void setBunchingHarmonicOutput(int harm_in);

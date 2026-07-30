@@ -267,11 +267,26 @@ case("time_wake", edit=e, **kw)
 e, kw = td({"track.field_dump_step": 50, "track.beam_dump_step": 50})
 case("time_dumps", edit=e, **kw)
 
+# -- incoherent synchrotron radiation ---------------------------------------
+# The three configurations take different branches: the loss alone is a per-step
+# scalar and needs no random numbers at all, the spread alone is drawn per
+# beamlet, and both together exercise the sum. The draws come from the host in
+# the order the CPU path consumes them, so these are ordinary comparisons rather
+# than statistical ones, and the beam column should sit at the same FP32 level
+# as a deck without any radiation.
+case("isr_loss", extra="&sponrad\nseed = 1234\ndoLoss = true\n&end\n")
+case("isr_spread", extra="&sponrad\nseed = 1234\ndoSpread = true\n&end\n")
+case("isr_both",
+     extra="&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n")
+# Under MPI each rank seeds its own generator and draws only for its own
+# slices, so the streams stay in step per rank rather than globally. This is the
+# case that would catch a backend which drew for the whole bunch instead.
+e, kw = td()
+kw["extra"] = kw.get("extra", "") + \
+    "&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n"
+case("time_isr", edit=e, **kw)
+
 # -- physics the GPU does not implement, which must be refused --------------
-case("refuse_isr_loss", extra="&sponrad\ndoLoss = true\n&end\n",
-     expect="error:incoherent synchrotron radiation")
-case("refuse_isr_spread", extra="&sponrad\ndoSpread = true\n&end\n",
-     expect="error:incoherent synchrotron radiation")
 case("refuse_spacecharge_short",
      extra="&efield\nnz = 2\nnphi = 2\nngrid = 32\n&end\n",
      expect="error:short-range space charge")
@@ -322,6 +337,13 @@ case("run_time_saturation", tier="run", edit=dict(e, **{"track.zstop": 40}), **k
 # written to the wrong copy would be repaired before it could be seen.
 case("run_chicane", tier="run", lat=LAT_CHICANE)
 case("run_corrector", tier="run", lat=LAT_CORRECTOR)
+# The radiation draws one random number per beamlet per step from a generator
+# that advances as the run proceeds, so the two paths agree only while they
+# consume their streams in step with each other. The step tier cannot see that:
+# it re-uploads the host state every step, which would paper over a stream that
+# had drifted by a step. A full run on each device is what checks it.
+case("run_isr", tier="run",
+     extra="&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n")
 
 
 # --------------------------------------------------------------------------

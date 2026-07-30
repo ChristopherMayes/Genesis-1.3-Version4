@@ -113,8 +113,8 @@ timings under a GPU label. The messages are explicit about the reason:
 *** Error: gpu = true in &track, but ngrid = 151 is not supported by the Metal
     field solver, which handles powers of two from 64 to 1024. Set ngrid = 128
     in &field. ...
-*** Error: gpu = true in &track, but incoherent synchrotron radiation
-    (isr_loss/isr_spread) is not implemented on the GPU yet
+*** Error: gpu = true in &track, but short-range space charge (nz/nphi in
+    &efield) is not implemented on the GPU yet
 ```
 
 ## What is supported
@@ -133,7 +133,8 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 | correctors | supported; the kick rides on the closing half step |
 | chicanes | supported; the transfer map rides on the opening half step and the R56 shear sits before the closing one |
 | wakefields (`&wake`) | supported, including the resistive wall |
-| ISR, short-range space charge | hard error |
+| incoherent radiation (`&sponrad`) | supported; both the loss and the spread, reproducing the CPU run rather than only its statistics |
+| short-range space charge | hard error |
 
 Everything in that table that is not supported is a hard error rather than a
 fallback. The reason is the same in each case: the alternative is a run that
@@ -220,6 +221,54 @@ every step and the run takes about 2.6 times as long, all of it on the host.
 That is the same host work the CPU path does, so it is not a GPU limitation, but
 it does mean a transient wake dominates a run that is otherwise a second long.
 
+### Incoherent synchrotron radiation
+
+A `&sponrad` block works on the GPU, both the mean energy loss (`doLoss`) and
+the quantum spread (`doSpread`). The interesting part is where the random
+numbers come from.
+
+`Incoherent::apply` draws one number per *beamlet* rather than per particle: it
+draws when `ip % nbins == 0` and gives the whole beamlet the same energy kick,
+so that the shot noise the beamlet was loaded with is not disturbed. The
+generator is `RandomU`, which is the `ran2` routine from Numerical Recipes — a
+pair of linear congruential sequences behind a shuffle table. A shuffle table
+has no practical jump-ahead, so a kernel cannot compute the *n*-th number of
+that sequence directly.
+
+The obvious answer is to put a different generator on the device, one that can
+be indexed, and accept that a GPU run then differs from a CPU run by a whole
+noise realisation rather than by round-off. This backend does not do that.
+Instead the draws are taken on the host, from the generator Genesis already
+uses, in the order the CPU path consumes them, and uploaded as one number per
+beamlet per step. A GPU run therefore reproduces a CPU run particle for
+particle, and the ordinary step-by-step comparison under `gpu_validate` keeps
+working: with radiation switched on, the beam agrees to 3.2e-06 over 1104 steps,
+which is the same figure as a deck with no radiation at all. Had the two paths
+drawn from different sequences, that number would have been of the order of the
+kick itself.
+
+The backend draws from its own generator, seeded identically to the one
+`Incoherent::apply` uses, rather than sharing it. Under `gpu_validate` both
+paths run, and a shared generator would have given the first path one set of
+numbers and the second the next set, so the two would have disagreed by the full
+size of the effect while both were behaving correctly.
+
+What this costs is host time, and it is the one place in the backend where that
+is true. On the 500-slice example the tracking loop goes from 4.64 s to 6.43 s
+with `doSpread` on, and the device busy time only from 4.32 s to 4.75 s: the
+extra 1.5 s is 100 million draws on the host, at about 15 ns each. The CPU path
+does exactly the same work, so this is not a penalty relative to it, but it does
+mean the radiation dilutes the speedup.
+
+With `doLoss` alone the kick is a per-step scalar, the same for every beamlet,
+and the draws are skipped entirely; the loop goes to 4.96 s, the extra being the
+buffer and one more dispatch. Skipping them is safe rather than a shortcut: the
+spread scales the draw by zero, so no result can depend on it.
+
+For scale, on the steady-state deck the radiation changes `Field/power` by 25%,
+`Beam/energyspread` by 8.9% and `Beam/bunching` by 9.5%. Against that, the two
+processors differ by 2.2e-04 in the field and 3.2e-06 in the beam.
+
 ## The worked example
 
 Everything below is in `examples/metal-gpu/` and takes a few minutes.
@@ -298,10 +347,10 @@ conda install -n genesis4-dev -c conda-forge h5py numpy
 
 ### 3. The full validation matrix
 
-`sweep.py` runs sixty-two decks against the CPU path on the same inputs and
-prints one line per case. Fifty-three of them compare per-step differences
-under `gpu_validate`, ten of those being decks the backend must refuse; the
-remaining nine run to completion and compare the output against a bound derived
+`sweep.py` runs sixty-five decks against the CPU path on the same inputs and
+prints one line per case. Fifty-five of them compare per-step differences
+under `gpu_validate`, eight of those being decks the backend must refuse; the
+remaining ten run to completion and compare the output against a bound derived
 from the per-step figure times the step count. A case that falls back to the CPU
 where it should not is a failure, because a fallback gives the right answer by
 the slow route and is exactly how an unported element would hide.

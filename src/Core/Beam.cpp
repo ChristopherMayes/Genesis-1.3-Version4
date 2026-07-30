@@ -121,11 +121,19 @@ bool Beam::computeWakeLoss(Undulator *und)
 }
 
 
+// Same idea for the incoherent radiation: the energy kick of one step, one
+// value per beamlet, with the particles left alone. See Incoherent::computeKick
+// for why this draws from its own generator.
+bool Beam::computeIncoherentKick(Undulator *und, double delz, vector<double> &dg)
+{
+  return incoherent.computeKick(this, und, delz, dg);
+}
+
+
 // Reports any effect that Beam::track applies but the GPU backend does not yet
 // implement. Used to refuse GPU tracking rather than silently dropping physics.
 bool Beam::gpuUnsupportedPhysics(string &what) const
 {
-  if (incoherent.isEnabled()) { what = "incoherent synchrotron radiation (isr_loss/isr_spread)"; return true; }
   if (solver.hasShortRangeSC()){ what = "short-range space charge (nz/nphi in &efield)"; return true; }
   return false;
 }
