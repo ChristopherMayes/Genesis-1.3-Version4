@@ -1536,7 +1536,9 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
     const float *r = (const float *)[p_->bFM contents];
     const std::complex<float> *fld =
         (const std::complex<float> *)[p_->bField[ih] contents];
-    const size_t mid = (nn - 1) / 2;
+    // The cell on the axis, as DiagField::getValues picks it. Both have to
+    // agree, since this is the value that ends up in intensity-nearfield.
+    const size_t mid = static_cast<size_t>(ng / 2) * ng + (ng / 2);
     auto uncentre = [](double c, double s1, double w) {
         return (w > 0.0) ? c + s1 * s1 / w : 0.0;
     };
