@@ -272,6 +272,47 @@ add them:
 conda install -n genesis4-dev -c conda-forge h5py numpy
 ```
 
+### 3. The full validation matrix
+
+`sweep.py` runs sixty-two decks against the CPU path on the same inputs and
+prints one line per case. Fifty-three of them compare per-step differences
+under `gpu_validate`, ten of those being decks the backend must refuse; the
+remaining nine run to completion and compare the output against a bound derived
+from the per-step figure times the step count. A case that falls back to the CPU
+where it should not is a failure, because a fallback gives the right answer by
+the slow route and is exactly how an unported element would hide.
+
+```sh
+cd examples/metal-gpu
+python3 sweep.py --workdir /tmp/g4sweep
+```
+
+It needs the same `h5py` and `numpy` as `compare.py`, and takes some minutes.
+Pass `--tier step` or `--tier run` for one tier only, and `--only <regex>` to
+select cases by name. This is the check to run after changing anything in the
+backend.
+
+`tools/fftcheck.mm` is a smaller and more direct check of the FFT kernels alone.
+It extracts the shader source from `src/Core/MetalEngine.mm`, so it always tests
+the code Genesis actually runs, compiles it for one grid shape, and compares a
+row, a column and a complete four-pass solve against a direct DFT in double
+precision. It is not part of the build, since it is a diagnostic rather than a
+regression test, and it is useful when the sweep says the field is wrong but not
+where:
+
+```sh
+clang++ -std=c++17 -fobjc-arc -framework Metal -framework Foundation \
+    -O2 tools/fftcheck.mm -o /tmp/fftcheck
+/tmp/fftcheck 256 16 16 8 16      # ngrid lanes regs rowsPerTG colsPerTG
+```
+
+Run it from the top of the source tree, since it reads the shader out of
+`src/Core/MetalEngine.mm` by relative path. The five shapes the backend itself
+uses are `64 8 8 16 16`, `128 8 16 16 16`, `256 16 16 8 16`, `512 16 32 4 8` and
+`1024 32 32 2 4`, taken from `pickFFTShape` in that file. All five report a row
+and column error of a few times `1e-6` against a scale of order ten, and a round
+trip through the complete solve accurate to `4e-07`.
+
 ## What agreement to expect
 
 The reference numbers below are from an M1 Max, both runs at 8 ranks. Nothing
