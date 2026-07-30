@@ -292,6 +292,39 @@ Two lessons about the harness itself are worth keeping:
       `npart` at large `ngrid`, seen from the other side. The strong case is the one worth
       keeping in the sweep: it changes `Field/xsize` by 25% while the paths differ by 1.5e-05.
 
+### Notes for the NVIDIA port
+
+Estimates for the three targets under consideration, scaled from the measured 6.0 GB moved per
+step and 287 GB/s achieved here (72% of this machine's 400 GB/s). The loop is memory bound, so
+bandwidth is the first-order predictor; treat these as +/- 30%.
+
+| card | peak BW | estimated loop | vs M3 Max |
+|---|---:|---:|---:|
+| M3 Max 40-core | 400 GB/s | 4.1 s measured | 1.0x |
+| RTX 5080 | 960 GB/s | ~1.7 s | ~2.4x |
+| L4 | 300 GB/s | ~5.5 s | ~0.7x |
+| A100 40GB | 1555 GB/s | ~1.1 s | ~3.9x |
+
+**A single L4 is slower than this laptop**, having less bandwidth than Apple's unified memory,
+and no amount of FP32 throughput changes that for a bandwidth-bound loop. It is still the most
+useful target of the three in context: one L4 lands within the uncertainty of one whole
+128-core node (4-9 s by two independent estimates), sixteen of them sit idle, and a realistic
+16-core share of a contended node would take about 45 s. Availability beats peak.
+
+Memory is the other axis and cuts the other way. This machine has 128 GB of unified memory; a
+deck at `ngrid = 1024` with four harmonics needs about 21 GB of field and scratch and does not
+fit on a 16 GB 5080 or a 24 GB L4 as a single rank. Splitting it across cards solves that,
+which is one more reason multi-GPU is worth doing early.
+
+**Oversubscribing ranks per GPU is worth it only when the device is not saturated**, and the
+report line says which case you are in. Measured here on one GPU: an ISR deck goes 4.94 s at
+one rank to 4.15 s at four, because the draws are host side and divide; a deck without ISR goes
+3.60 s to 3.71 s, because the device was already 95% busy.
+
+`manual/GPU.md` carries the rest: what `GPUEngine` requires, the four constraints that carry
+over, the per-step host round trips that become PCIe transfers on a discrete card, the FP64
+question, cuFFT, and the multi-GPU section covering device selection from the MPI local rank.
+
 ### Constraints that must not be forgotten
 
 - Apple GPUs have **no FP64**. Metal has no `double`. FP32 is mandatory, not a choice.

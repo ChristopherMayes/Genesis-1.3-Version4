@@ -13,7 +13,7 @@ Everything the Apple backend does is in single precision. That is not a tuning c
 - [What agreement to expect](#what-agreement-to-expect)
 - [Performance notes](#performance-notes)
 - [Where the code lives](#where-the-code-lives)
-- [Porting to another GPU](#porting-to-another-gpu)
+- [Porting to another GPU](#porting-to-another-gpu), including [running on several at once](#more-than-one-gpu)
 
 ## Requirements
 
@@ -407,11 +407,34 @@ The largest difference is that the memory is not unified. This backend allocates
 
 None of these is large in itself, but each is a synchronisation point, and on a discrete card a synchronisation costs more than the transfer does. The measurement that decides the design is worth repeating on the target machine before optimising anything: the report line at the end of a `&track` block gives the wall clock of the loop and the device busy time, and if the second is much smaller than the first then the host, the transfers or the launches are the limit rather than the arithmetic.
 
+For scale, the tracking loop of the 500-slice benchmark moves 6.0 GB per step and achieves 287 GB/s on this machine, which is 72% of its 400 GB/s peak. Since the loop is memory-bound rather than arithmetic-bound, the memory bandwidth of the target is the first-order predictor of what it will do, and a card with less bandwidth than an Apple laptop will be slower than one however many teraflops it advertises. Scaling that measurement at the same efficiency suggests about 1.7 s on a card with 960 GB/s, 5.5 s on one with 300 GB/s and 1.1 s on one with 1555 GB/s, against the 4.1 s measured here. Treat those as estimates with a wide margin: the transform was shaped around Metal's 32 KB of threadgroup memory, and a device offering more could do better.
+
 Double precision is available on NVIDIA hardware, and that changes what is worth doing. On a datacentre card it runs at half the single-precision rate and would give agreement with the CPU limited only by the order of operations, which would make `gpu_validate` a much sharper instrument; on a consumer card it runs at a thirty-second or a sixty-fourth of the rate and is not worth having. A backend could reasonably offer both and let the deck choose. Note that the interface already exposes `gammaRef`, which a double-precision backend does not need but costs nothing to keep.
 
 `cuFFT` exists and the hand-written transform does not have to be reproduced. Three things about the field solve are fused into the transform passes here and would have to be handled either with callbacks or as separate elementwise kernels: the `expK` multiply on the inverse row pass, the source addition on the inverse column pass, and, when the source filter is on, the filter multiply on the forward column pass of the source. Whether that is faster than a hand-written kernel is a question for measurement; on this hardware the four-pass fused form runs at close to the memory bandwidth of the machine.
 
 The remaining mapping is mechanical. A threadgroup is a block and threadgroup memory is shared memory; a SIMD group is a warp, and the `simd_sum` reductions in the diagnostics become warp shuffles or `cub::BlockReduce`. `threadgroup_barrier` is `__syncthreads`. One point of friction disappears: Metal has `atomic_float` in the device address space only, so the source deposition and the space-charge accumulation use a compare-and-swap loop on the bit pattern in shared memory, whereas CUDA has `atomicAdd` for floats in shared memory directly. The shaders are compiled from source at startup here, with the grid size and the transform shape injected as preprocessor macros, which on CUDA would more naturally be template parameters instantiated at build time; that also removes the startup cost.
+
+### More than one GPU
+
+Genesis parallelises over slices with MPI, and each rank constructs its own engine and owns its own slices, so a job spread over several GPUs is the arrangement that already exists with a different device attached to each rank. Nothing in `GPUEngine` or in the tracking loop assumes there is only one device. This has never been exercised here, because the machine this backend was written on has a single GPU, but it is the configuration most clusters actually offer: four cards in a node, or a pool of cards across several nodes.
+
+What a backend has to add is device selection, and it has to come from the rank's position within its node rather than from its rank in the job. Split the communicator with `MPI_Comm_split_type` and `MPI_COMM_TYPE_SHARED`, take the rank within that, and select `local_rank % devices_visible`. Using the global rank instead puts every rank of a four-node job on device 0 of its node and leaves three quarters of the hardware idle, which is easy to do and produces a correct answer at a quarter of the speed.
+
+One rank per GPU is the right default, because a single rank already saturates the device: on this machine the tracking loop takes 4.1 s at one rank and 4.1 s at twelve, all pointed at the same GPU. The exception is a deck whose host-side work is significant, and the report line identifies it — a device busy percentage well below 100% means the host, not the device, is setting the pace. Incoherent radiation with `doSpread` is the case in this backend, since the draws are taken on the host:
+
+| 500-slice deck, one GPU | 1 rank | 2 ranks | 4 ranks |
+|---|---:|---:|---:|
+| with `doSpread` | 4.94 s, 71% busy | 4.37 s, 72% busy | 4.15 s, 52% busy |
+| without | 3.60 s, 95% busy | | 3.71 s, 52% busy |
+
+Oversubscribing ranks divides the host work and leaves the device work where it was, so it helps the first deck by 16% and very slightly hurts the second. Choose the rank count from the busy percentage rather than from the core count.
+
+Splitting a job across GPUs also splits the memory, since each rank holds only the slices it owns. That is the more important consequence on cards with modest memory: a deck at `ngrid = 1024` with four harmonics needs about 21 GB of field and scratch, which does not fit on a 24 GB card as one rank but fits comfortably as four.
+
+The scaling is not free. The slippage exchanges one field slice per step between neighbouring ranks, which on a single device is a pull and a push through the host and between devices becomes a host round trip on each side unless the MPI is CUDA-aware, in which case it can go device to device. At `ngrid = 256` that slice is 1 MB. The wakefield and the long-range space charge additionally perform an `MPI_Allgather` over all slices at every step, which is host-side work that does not shrink as ranks are added and which sets a floor for those decks. And as ranks multiply the work per rank falls: 500 slices across sixteen cards is 31 slices each, about 1.8 ms of device work per step, against launch and synchronisation overheads of the order of 0.1 ms. Expect the useful limit to arrive well before the arithmetic says it should, and measure rather than extrapolate.
+
+One caution when comparing runs across configurations: Genesis pads the slice count to a multiple of the rank count and distributes the slices accordingly, so the shot-noise realisation depends on the rank count. A four-rank run and a sixteen-rank run of the same deck are different noise seeds, and the difference between them is much larger than anything the GPU contributes. Compare like with like.
 
 ### Validating a new backend
 
