@@ -46,8 +46,11 @@ and switch on per `&track` block with `gpu = true` (plus `gpu_validate = true` t
 path alongside and report the difference).
 
 - [x] Metal FFT field solver — radix-16, **14.4 µs/slice-step, 365 GB/s (91% of peak)**
-- [x] Threadgroup-tiled deposition — 10.2 → **3.3 µs/slice-step**
 - [x] Engine scaffolding, upload/download round trip, GPU field solve, GPU beam step
+- [x] **Backend-neutral seam** — `GPUEngine` is the interface the tracking loop talks to and
+      `MetalEngine` implements it. `Gencore.cpp` has no `#ifdef` and nothing device specific
+      left in it, so a CUDA or HIP backend is a subclass plus one branch in
+      `GPUEngine::create()`. `GPUEngine.h` records the constraints such a backend inherits.
 - [x] Namelist control (`gpu`, `gpu_validate`) and hard errors for unported physics
 - [x] **Validation matrix** — `examples/metal-gpu/sweep.py`, about 52 cases over undulator
       geometry, transport, lattice errors, grid size, harmonics, beam parameters, collective
@@ -56,17 +59,28 @@ path alongside and report the difference).
 - [x] **Full residency** — no per-step marshalling; the host only sees the arrays at dumps,
       at the slippage boundary slice, and at the end of `&track`
 
-**Measured (500 slices, zstop=10, ngrid=256, 1 harmonic, output_step=1, M1 Max):**
+**Measured (500 slices, zstop=10, ngrid=256, 1 harmonic, output_step=1, M3 Max, 12
+performance cores, 40-core GPU). End-to-end wall clock:**
 
-| config | wall | vs 1 CPU core | vs 8 CPU cores |
+| config | wall | vs 1 CPU core | vs 12 CPU cores |
 |---|---|---|---|
-| CPU 1 rank | 375.8 s | 1× | — |
-| CPU 8 ranks | 53.3 s | 7.0× | 1× |
-| GPU 1 rank | **1.55 s** | **242×** | **34×** |
-| GPU 4 ranks (one GPU) | **0.95 s** | **396×** | **56×** |
+| CPU 1 rank | 309.1 s | 1× | — |
+| CPU 12 ranks | 35.2 s | 8.8× | 1× |
+| GPU 1 rank | **5.5 s** | **56×** | **6.4×** |
+| GPU 12 ranks (one GPU) | **4.4 s** | **70×** | **8.0×** |
 
-Extra MPI ranks against the single GPU are worth only about 1.6× and stop helping past
-four: the ranks queue on one GPU and there is no longer any host work left to overlap.
+About 1 s of every one of those is setup and output, on both paths, so on the tracking loop
+alone the GPU is 4.1 s against about 34 s for twelve ranks, i.e. **8×**.
+
+Extra MPI ranks against the single GPU are worth **nothing**: the tracking loop is 4.1 s at
+one rank and 4.1 s at twelve, and the device is already 92% busy at one rank.
+
+**Every GPU timing before this was overstated by about 4×.** Genesis' `Total Wall Clock
+Time` was `clock()`, i.e. processor time, which equals the wall clock for a CPU run that
+never waits and does not for a GPU run that does: waiting costs no CPU and the shader
+compile runs in another process. `GenMain.cpp` now uses `std::chrono::steady_clock`, and a
+GPU `&track` block reports the loop's wall clock and the device's own busy time beside it.
+**A speedup measured with a timer that does not count waiting is not a speedup.**
 
 Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize` 4.8e-05,
 `Beam/bunching` 2.7e-04, `Beam/energyspread` 3.7e-06 — the FP32 level throughout.
@@ -97,8 +111,16 @@ Two lessons about the harness itself are worth keeping:
   uniform scale is nearly an eigenmode of the amplifier. Raising `npart` sixteenfold does not
   move the end-to-end difference either, so it is not granularity. What does work is the step
   tier's own measurement: the largest single-step difference times the number of steps is the
-  most that round-off alone can produce, and every case stays under it. `run_two_track_blocks`
-  is the closest at 1.3x the bound.
+  most that round-off alone can produce, and every case stays under it. `run_corrector` is the
+  closest at 1.3x the bound.
+- **A case that only fails on one machine is still a real failure.** On the M3 Max
+  `run_two_track_blocks` came out at 2.2x the bound, where the M1 Max had it at 1.3x. It was
+  not the machine and not a regression — the same commit failed the same way — but a
+  pre-existing upstream defect that the GPU makes unavoidable: the on-axis near-field
+  diagnostic samples cell `(ngrid*ngrid-1)/2`, which is the axis only for an odd `ngrid`. The
+  GPU only takes powers of two, so every GPU run was reporting a cell at the edge of the grid,
+  five orders of magnitude down, where the FP32 difference is naturally percent-level. Fixed
+  in `Diagnostic.cpp`, `Field.cpp` and the backend at once, and the case drops to 2.4e-03.
 
 ### Still to do
 
@@ -145,8 +167,23 @@ Two lessons about the harness itself are worth keeping:
       runs in a CPU-only build, where a profile puts `DiagBeamUser` at 2.0% and all of
       `Diagnostic::calc` at 17.9% of the run — worth having, but below the run-to-run noise of
       a 370 s job. Should go upstream on its own branch off master.
-- [ ] `fieldMoments` is now 22% of single-rank time and runs every step. It only feeds the
-      diagnostics, so it could be skipped on steps that produce no output.
+- [x] **The diagnostics are the remaining 38% of the tracking loop** (`output_step = 100`
+      takes the loop from 4.1 s to 2.6 s). They are already on the device and already skipped
+      on steps that produce no output, so what is left is to move less memory. The far-field
+      branch used to copy each slice and transform the copy in place; the row pass now reads
+      the field and writes the scratch buffer directly, which removed a read and a write of
+      every grid point and was worth 8% of the whole loop. Going further means either keeping
+      the transform as magnitudes, which costs another buffer a third the size of the field, or
+      raw instead of centred second moments, which loses precision exactly when the beam is off
+      axis. Neither trade looked worth making.
+- [x] Measured the source deposition at 6% of the loop by disabling it, which settles the
+      question of the tiled deposition: it cannot repay a threadgroup accumulation and the
+      `ngrid % 32` constraint that comes with it, whatever a microbenchmark of the kernel alone
+      says. The atomics version stays.
+- [ ] `fieldStep`, `beamStep` and each `fieldMoments` call commit their own command buffer and
+      wait. At 92% device busy this costs little on a 500-slice deck, but on a small one it is
+      most of the time (`validate.in` runs at 16% busy). Merging a step into one command buffer
+      would help those, and needs double-buffering of the small host-written arrays.
 
 ### Constraints that must not be forgotten
 
@@ -162,6 +199,20 @@ Two lessons about the harness itself are worth keeping:
 - The tiled deposition requires `ngrid % 32 == 0`, one more reason to prefer 256 over 255.
 
 ## 3. Housekeeping / possible upstream reports
+
+Two of these are now fixed on `gpu/metal-engine` and are worth their own branches off
+`master`, since neither has anything to do with the GPU:
+
+- **`Total Wall Clock Time` was `clock()`**, i.e. processor time, not wall clock. Identical
+  for a CPU run that never waits; four times too small for one that waits on a device, and it
+  also ignores every rank but the zeroth. `GenMain.cpp` now uses `std::chrono::steady_clock`.
+- **The on-axis near-field diagnostic samples the wrong cell for an even `ngrid`.**
+  `(ngrid*ngrid-1)/2` is the axis only when `ngrid` is odd; for an even grid it is the last
+  column of the row below the middle, i.e. the edge of the grid, where the field is orders of
+  magnitude smaller. `intensity-nearfield` and `phase-nearfield` are then reporting a corner of
+  the box. `(ngrid/2)*ngrid + ngrid/2` is identical for odd `ngrid` and right for even, and is
+  now used in `Diagnostic.cpp`, `Field.cpp` and the backend. Nobody noticed because the
+  traditional Genesis convention is an odd `ngrid`; the GPU only takes powers of two.
 
 - `export FI_PROVIDER=tcp` is required on macOS with conda MPICH — the default libfabric
   provider busy-polls and costs **5.9× at 8 ranks** (96.0 s → 16.3 s). Worth a manual note.

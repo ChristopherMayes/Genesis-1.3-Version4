@@ -1,11 +1,12 @@
 # Timing and accuracy reference, GPU half. See sase_cpu.in.
 #
-#   mpirun -n 4 genesis4 sase_gpu.in
+#   genesis4 sase_gpu.in
 #
-# Several MPI ranks share the one GPU. That is worth about 2.9x over a single
-# rank on an M1 Max, because the host-side diagnostic assembly and the HDF5
-# buffering of one rank overlap with the GPU work of another. Compare against
-# sase_cpu.in run at the same rank count.
+# One rank is enough: the report at the end of the run shows the device already
+# better than 90% busy, so extra MPI ranks pointed at the same GPU only share
+# out the work they are queueing for. To compare against sase_cpu.in, run that
+# one at the rank count you would actually use for a CPU run, and see the
+# warning there about comparing output files across different rank counts.
 
 &setup
 rootname=sase_gpu

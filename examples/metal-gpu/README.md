@@ -24,7 +24,7 @@ side by side and compares them every step. Takes a few seconds. The last line
 is the answer:
 
 ```
-Metal vs CPU over 1104 steps: max relative error, field 0.00022943, beam 3.25662e-06
+Metal vs CPU over 1104 steps: max relative error, field 0.000207, beam 3.18e-06
 ```
 
 That is the FP32 round-off level accumulated over the whole undulator. Anything
@@ -49,20 +49,22 @@ on how the slices are spread over the ranks, so a 1-rank and an 8-rank CPU run
 of this deck already differ by 7e-2 in `Field/power`; comparing across rank
 counts measures that and not the GPU.
 
-Tracking time on an M1 Max (8 performance cores, 32-core GPU):
+Wall clock end to end on an M3 Max (12 performance cores, 40-core GPU):
 
 | ranks | `sase_cpu.in` | `sase_gpu.in` |
 |---:|---:|---:|
-| 1 | 415.7 s | 7.45 s |
-| 4 | 98.5 s | 2.58 s |
-| 8 | 54.2 s | 1.94 s |
+| 1 | 309.1 s | 5.5 s |
+| 4 | 82.1 s | 4.6 s |
+| 12 | 35.2 s | 4.4 s |
 
-Several MPI ranks sharing the one GPU is worth almost 4x, because the host-side
-diagnostic and HDF5 work of one rank overlaps the GPU work of another.
+So the GPU is worth about 8x all twelve cores and about 75x one of them, on the
+tracking loop alone. **Extra MPI ranks do not help a GPU run**: the line printed
+at the end of the run reports the device already 92% busy at one rank, so the
+ranks only divide up work they then queue for.
 
-`export FI_PROVIDER=tcp` is not optional. Conda's MPICH busy-polls by default,
-which costs a factor of 21 on the 8-rank GPU run (40.9 s instead of 1.94 s) and
-still a factor of four on a serial run with no MPI communication in it at all.
+`export FI_PROVIDER=tcp` is not optional. Conda's MPICH busy-polls while it
+waits, and the faster the compute the more of the machine that wastes: a factor
+of four even on a serial run with no MPI communication in it at all.
 
 `compare.py` needs `h5py` and `numpy`, which the conda environment used to
 *build* Genesis will not have unless you add them

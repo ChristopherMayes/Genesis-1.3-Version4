@@ -17,6 +17,7 @@ times `1e-4` on field amplitudes, which the section on
 - [The worked example](#the-worked-example)
 - [What agreement to expect](#what-agreement-to-expect)
 - [Performance notes](#performance-notes)
+- [Where the code lives, and adding another backend](#where-the-code-lives-and-adding-another-backend)
 
 ## Requirements
 
@@ -89,6 +90,19 @@ with it: without it the CPU half uses the ADI solver and the reported
 difference measures the two solvers against each other rather than the two
 processors.
 
+At the end of a GPU `&track` block one line reports what the device did:
+
+```
+Metal: 196 steps in 4.09731 s, device busy 3.79265 s (93%)
+```
+
+The wall clock of the tracking loop, then the time the device itself spent
+executing, which Metal timestamps on every command buffer at no cost. The
+percentage answers the only question worth asking before reaching for more
+hardware: a device that is already busy will not go faster if more MPI ranks
+are pointed at it, and one that is idling means the host is the limit. Neither
+number is Genesis' own `Total Wall Clock Time`, which covers the whole program.
+
 A deck that asks for the GPU and cannot have it is an error, not a silent
 fallback — otherwise the run would quietly produce CPU numbers and CPU
 timings under a GPU label. The messages are explicit about the reason:
@@ -143,20 +157,20 @@ chosen per grid size and injected into the shader as preprocessor macros when
 the Metal library is compiled, so there is no runtime branching in the inner
 loop.
 
-| `ngrid` | REGS x LANES | radices used | time for the SASE example |
-|---:|---:|---|---:|
-| 64 | 8 x 8 | 8, 8 | 0.78 s |
-| 128 | 16 x 8 | 16, 8 | 0.95 s |
-| 256 | 16 x 16 | 16, 16 | 1.53 s |
-| 512 | 32 x 16 | 32, 16 | 3.93 s |
-| 1024 | 32 x 32 | 32, 32 | 14.8 s |
+| `ngrid` | REGS x LANES | radices used | tracking loop | device busy |
+|---:|---:|---|---:|---:|
+| 64 | 8 x 8 | 8, 8 | 1.01 s | 75% |
+| 128 | 16 x 8 | 16, 8 | 1.70 s | 81% |
+| 256 | 16 x 16 | 16, 16 | 4.13 s | 91% |
+| 512 | 32 x 16 | 32, 16 | 15.8 s | 97% |
+| 1024 | 32 x 32 | 32, 32 | 66.7 s | 99% |
 
-The cost is close to the `N^2 log N` the transform implies once the grid is big
-enough to fill the machine: 64 to 128 barely moves because a 64-point grid does
-not saturate the GPU, and from 256 upwards each doubling costs about 2.6x, then
-3.8x. Earlier versions of this table were flat at around 7 s across the whole
-range because a host-side diagnostic bug dominated every configuration; see the
-performance notes below.
+The SASE example at one rank, on an M3 Max. Each row has four times the grid
+points of the one above, and from 256 upwards each doubling costs about four
+times as much, which is what a memory-bound transform should do. The small
+grids cost less than that only because they do not fill the machine: the busy
+column is what says so, and it is the reason a small deck sees less of the GPU
+than a large one does.
 
 Agreement with the CPU degrades with grid size, but the grid is not really the
 cause. Over the 1104 steps of the validation deck, holding `npart` at 8192, the
@@ -219,15 +233,16 @@ export FI_PROVIDER=tcp
 ```
 
 Set `FI_PROVIDER=tcp` before anything else if you are using conda's MPICH; see
-[the performance notes](#performance-notes). It is worth a factor of four even
-on this single-rank run.
+[the performance notes](#performance-notes). It is worth 40% even on this
+single-rank run, which does no communication at all, and a factor of four on a
+run with several ranks.
 
 This is a steady-state run of the ARAMIS undulator with the shot noise off and
 a seeded field, so it is deterministic, and it runs both paths and compares
 them every step. The last line is the point of it:
 
 ```
-Metal vs CPU over 1104 steps: max relative error, field 0.00022943, beam 3.25662e-06
+Metal vs CPU over 1104 steps: max relative error, field 0.000207, beam 3.18e-06
 ```
 
 Those two numbers are the FP32 round-off level accumulated over 1104 steps. If
@@ -237,12 +252,21 @@ number above about `1e-3` means it is wrong, not merely less precise.
 It also prints, at the start,
 
 ```
-Metal backend: Apple M1 Max, 1 MB resident, gamma_ref = 11357.8
+Metal backend: Apple M3 Max, 1 MB resident, gamma_ref = 11357.8
   host transfer check: field 4.5e-08   beam 4.4e-08 (relative, FP32 rounding is ~1e-7)
 ```
 
 which confirms the device that was picked and that the upload round trip is
-clean before any physics happens.
+clean before any physics happens. The timing line from this deck,
+
+```
+Metal: 1104 steps in 6.09251 s, device busy 1.00931 s (17%)
+```
+
+is not a performance figure and should not be read as one: `gpu_validate` runs
+the CPU path as well, and a steady-state deck has one slice, so there is almost
+nothing for the device to do. It is the small-problem case in the plainest
+possible form — see the performance notes for the same line on a real run.
 
 ### 2. Timing and a real comparison
 
@@ -315,20 +339,21 @@ trip through the complete solve accurate to `4e-07`.
 
 ## What agreement to expect
 
-The reference numbers below are from an M1 Max, both runs at 8 ranks. Nothing
+The reference numbers below are from an M3 Max, both runs at 8 ranks. Nothing
 here should be much different on another Apple Silicon machine, since the
 arithmetic is the same.
 
 ```
 amplitudes, relative                         error       scale
-  Field/Global/intensity-farfield       6.605e-04   3.447e+20
-  Field/intensity-farfield              6.246e-04   1.768e+21
-  Field/ydivergence                     6.054e-04   1.599e-05
-  Field/intensity-nearfield             5.354e-04   2.600e+14
-  Beam/bunching                         2.202e-04   1.241e-02
-  Field/power                           1.728e-04   1.338e+07
-  Field/xsize                           4.891e-05   7.737e-05
-  worst of 51: 6.605e-04
+  Field/Global/intensity-farfield       6.616e-04   3.447e+20
+  Field/intensity-farfield              6.532e-04   1.768e+21
+  Field/ydivergence                     6.055e-04   1.599e-05
+  Field/xdivergence                     4.219e-04   1.590e-05
+  Field/intensity-nearfield             3.948e-04   1.104e+16
+  Beam/bunching                         1.925e-04   1.241e-02
+  Field/power                           1.449e-04   1.338e+07
+  Field/xsize                           4.592e-05   7.737e-05
+  worst of 51: 6.616e-04
 ```
 
 Three things make raw dataset-by-dataset comparison misleading, and
@@ -352,6 +377,16 @@ on-axis cell, which passes through zero at optical vortices while the slice as
 a whole is still bright. `compare.py` wraps them and masks out the points where
 the companion intensity is below a thousandth of its peak; what is left agrees
 to about `1e-2` radians.
+
+One more thing about the on-axis quantities, since a GPU run is where it shows.
+`intensity-nearfield` and `phase-nearfield` are the field in the cell at the
+centre of the grid, and that cell used to be picked as `(ngrid*ngrid-1)/2` —
+which is the centre only for an odd `ngrid`. For an even one it lands at the
+edge of the grid, where the field is orders of magnitude smaller and a
+percent-level difference between two runs means nothing. Since this backend
+accepts only powers of two, every GPU run hit it. The index is now
+`(ngrid/2)*ngrid + ngrid/2`, unchanged for odd grids, and the end-to-end
+agreement on the validation cases improved by an order of magnitude with it.
 
 Finally, the CPU is not a fixed target to compare against. `FieldSolverFFT`
 plans its transforms with `FFTW_MEASURE`, so two runs of the *same* CPU binary
@@ -380,46 +415,56 @@ cost any accuracy.
 
 ## Performance notes
 
-Wall clock for the tracking loop, as Genesis reports it, on an M1 Max
-(8 performance + 2 efficiency cores, 32-core GPU, 64 GB):
+End-to-end wall clock of `sase_cpu.in` and `sase_gpu.in` — 500 slices,
+`ngrid = 256`, 196 steps, diagnostics at every step — on an M3 Max
+(12 performance + 4 efficiency cores, 40-core GPU, 128 GB):
 
 | ranks | `sase_cpu.in` | `sase_gpu.in` |
 |---:|---:|---:|
-| 1 | 375.8 s | 1.55 s |
-| 2 | — | 1.14 s |
-| 4 | 97.8 s | 0.95 s |
-| 8 | 53.3 s | 1.02 s |
+| 1 | 309.1 s | 5.5 s |
+| 2 | 158.5 s | 4.8 s |
+| 4 | 82.1 s | 4.6 s |
+| 8 | 45.9 s | 4.5 s |
+| 12 | 35.2 s | 4.4 s |
 
-So the single GPU at one rank is about 240x one core and about 34x all eight,
-and the best GPU configuration is about 56x the best CPU one.
+About a second of each of those is setup, loading and the output file, on both
+paths. The tracking loop itself is 4.1 s on the GPU and about 34 s on twelve
+CPU ranks, so **the GPU is worth roughly 8x all twelve cores, and 75x one of
+them** — and it leaves the cores free while it works.
 
-**Running several MPI ranks against the one GPU helps, but only up to a point.**
-Two ranks are worth 1.4x and four are worth 1.6x; eight are slower than four.
-The ranks queue on a single GPU, so once the host is out of the way there is
-nothing left to overlap and the extra ranks only add communication and startup.
-Four is a good default on this machine. Earlier versions of this document
-claimed 2.9x at four ranks and 3.8x at eight, and explained it as host
-diagnostic work overlapping GPU work. That explanation was correct about the
-mechanism but the host work in question was almost entirely a bug, and with it
-fixed the effect largely disappears.
+**Measure with a clock, not with `clock()`.** Until recently Genesis' own
+`Total Wall Clock Time` was processor time, not wall clock, which is the same
+thing for a CPU run that never waits and badly wrong for a GPU run that does:
+this deck reported 1.2 s while actually taking 5.5 s, because the waiting costs
+no CPU and the shader compile happens in another process. That line is now
+genuine wall clock. Earlier versions of this chapter quoted the old figures and
+so overstated the GPU by about a factor of four; the numbers above supersede
+them.
+
+**More MPI ranks against the one GPU do nothing.** The tracking loop takes 4.1 s
+at one rank and 4.1 s at twelve. The report at the end of the run says why: at
+one rank the device is already 92% busy, so there is nothing to overlap and the
+extra ranks only divide up work they then queue for. Use one rank for a GPU run
+unless the deck needs the memory of several nodes; the earlier advice to use
+four came from the mismeasurement above.
+
+**Where the 4.1 s goes**, for anyone looking to make it smaller: 38% is the
+per-slice diagnostics (`output_step = 100` takes the loop from 4.1 s to 2.6 s),
+6% is the source deposition, and the rest is the four FFT passes, the
+Runge-Kutta push and the transverse map. The field solve runs at close to the
+memory bandwidth of the machine, so the diagnostics are where the remaining
+headroom is, and `output_step` is the knob that costs nothing to turn.
 
 **One fallback step costs more than it looks.** A step the GPU refuses is not
 merely a step taken at CPU speed: the particles and the field have to come back
 to the host before it and go out again afterwards, so the step is slower than
 it would have been on the CPU alone. Correctors used to be refused, and since
 `orbiterror = true` is implemented as a corrector at every step, an orbit-error
-deck spent 187 of its 196 steps that way. On a 400-slice run at eight ranks:
-
-| | wall clock |
-|---:|---:|
-| CPU | 46.2 s |
-| GPU, correctors refused | 25.2 s |
-| GPU, correctors ported | 9.4 s |
-
-No lattice element falls back any more. The machinery is still there, and a
-step that does fall back is still counted and reported at the end of the run,
-but nothing currently triggers it. Everything the backend cannot do is a hard
-error instead.
+deck spent 187 of its 196 steps that way, which cost about two thirds of the
+benefit of the GPU on that deck. No lattice element falls back any more. The
+machinery is still there, and a step that does fall back is still counted and
+reported at the end of the run, but nothing currently triggers it. Everything
+the backend cannot do is a hard error instead.
 
 **`export FI_PROVIDER=tcp` is not optional** if you are using conda's MPICH on
 macOS. The default libfabric provider busy-polls while waiting, and the faster
@@ -427,21 +472,84 @@ the compute gets the more of the machine that wastes:
 
 | | without | with |
 |---|---:|---:|
-| `validate.in`, serial, no `mpirun` | 21.8 s | 5.02 s |
-| `sase_gpu.in`, 8 ranks | 31.2 s | 1.15 s |
+| `validate.in`, serial, no `mpirun` | 8.9 s | 6.3 s |
+| `sase_gpu.in`, 8 ranks | 18.9 s | 5.0 s |
 
-The first row has no MPI communication in it at all — one rank, launched
-directly — and still loses a factor of four. Put the export in your shell
-profile.
+The second row is the one that matters: eight ranks waiting on each other and
+on one GPU spend nearly four times the wall clock spinning. The first has no
+MPI communication in it at all — one rank, launched directly — and still loses
+40%. Put the export in your shell profile. The cost varies with the MPICH build;
+an earlier one lost a factor of four even on the serial row.
 
-**Startup is not free.** The Metal shaders are compiled from source when the
-first `&track` block starts. It does not scale with the problem, but now that
-the tracking loop itself is around a second it is a visible part of the wall
-clock end to end. Longer runs amortise it; it is only worth thinking about if
-you are timing something small.
+**Startup is not free, but it is not the problem either.** The Metal shaders are
+compiled from source when the first `&track` block starts, in another process,
+and it does not scale with the problem. On this deck the whole fixed cost of a
+GPU run — loading, shader compile, output file — is about 1 s, against about
+0.9 s for the CPU path, whose own fixed cost is mostly FFTW planning its
+transforms with `FFTW_MEASURE`. Neither is worth optimising unless the tracking
+loop is shorter than either.
 
 **`output_step` matters much less than it used to.** The per-slice diagnostics
 are computed on the GPU, by one threadgroup per slice, so `output_step = 1`
 costs very little: 1.57 s against 1.45 s at `output_step = 100` for this deck.
 That was not true before the host-side diagnostic assembly was fixed, when the
 same pair was 7.33 s and 1.48 s.
+
+## Where the code lives, and adding another backend
+
+Six files, of which one is the backend:
+
+| | |
+|---|---|
+| `include/GPUEngine.h` | the interface the tracking loop talks to, and the design constraints any backend has to respect |
+| `src/Core/GPUEngine.cpp` | which backend to build and use; one branch per backend |
+| `include/MetalEngine.h`, `src/Core/MetalEngine.mm` | the Apple Silicon backend: the Metal shaders and the host code that drives them |
+| `include/SliceMoments.h` | the per-slice diagnostic moments, in the normalisation `DiagBeam` and `DiagField` expect |
+| `src/Core/Gencore.cpp` | the tracking loop, which contains no device-specific code and no preprocessor conditionals |
+
+A second backend — CUDA, HIP, SYCL — is a new implementation of `GPUEngine`
+plus one branch in `GPUEngine::create()`, and nothing in the tracking loop
+changes. The interface is deliberately coarse: whole steps and whole
+reductions, not individual kernels, because the cost that dominates is not
+arithmetic but synchronisation.
+
+Four things about the design are not Apple specific and would have to be
+reproduced rather than reconsidered.
+
+**The beam and the field stay resident for the whole `&track` block.** This is
+the reason the interface looks the way it does. Marshalling the host arrays in
+and out every step costs 38 ms per step on this problem against about 11 ms of
+compute, so a solver plugged in behind `FieldSolver::advance`, which would have
+to copy on every call, cannot pay off however fast its kernels are. The beam
+and the field are coupled in both directions every step — the deposition reads
+the particles, the Runge-Kutta push gathers the field — so neither can move to
+the device without the other.
+
+**The diagnostics have to be reduced on the device too.** They are not a small
+share of the arithmetic once the tracking is fast: on this deck they are 38% of
+the tracking loop with `output_step = 1`. Leaving them on the host would also
+break residency, because they read every particle and every grid point.
+
+**Unsupported physics is refused by name, never worked around.** A run that
+completes and writes a plausible output file having quietly dropped an effect
+the deck asked for is the worst failure mode available here, and it is what the
+hard errors and `sweep.py`'s treatment of an unexpected CPU fallback exist to
+prevent.
+
+**Single precision has to be arranged for, not merely accepted.** Metal has no
+`double` at all, so this is not optional on Apple hardware; a backend with FP64
+would not need `gammaRef()`, but it costs nothing to keep. Two reformulations
+in `MetalEngine.mm` are the ones to copy: gamma carried as an offset from a
+reference energy, and the longitudinal momentum formed as `gamma*sqrt(1-r)`
+rather than `sqrt(gamma^2-1-aw^2-p^2)`, since at gamma = 11357 the FP32 quantum
+of gamma squared is about 15 and the subtraction loses the whole transverse
+contribution.
+
+The comments at the head of `MetalEngine.mm` list the mistakes that were made
+once already: the parameter structs are written twice, once in the shader
+string and once in host C++, so editing one alone skews the layout silently;
+dispatch geometry has to be parameterised at every dispatch site, since
+hard-coding it at one site only breaks at grid sizes other than the one being
+developed against; and the order of operations within a step has to mirror
+`Beam::track` exactly, down to the corrector kick landing before the
+longitudinal momentum factor is formed and only on the closing half step.
