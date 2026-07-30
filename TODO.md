@@ -31,18 +31,27 @@ one worth explaining: on a CPU-only build with `ngrid = 256`, `Field/intensity-n
 peaks at 3.0e15 W/m^2 where the power and spot size imply 1.2e18 on axis — a factor of 400
 low, because the sampled cell is at the edge of the grid. With the fix it reads 1.5e18.
 
-### Not sent yet: the electron rest energy
+The third draft is [#278](https://github.com/svenreiche/Genesis-1.3-Version4/pull/278),
+`fix/electron-rest-energy`. `eev` was 510999.06 eV and is now 510998.95069, the CODATA 2022
+value, and the places that open-coded it as the literal `511000` — `BeamSolver.cpp`,
+`Collective.cpp`, `EFieldSolver.h`, and the backend, which is not part of the PR — now use
+the constant. The name stays `eev` rather than becoming something clearer such as `mec2`,
+because it is upstream's own name with 33 uses in 25 files, and renaming it would put a
+conflict in every one of them for no functional gain.
 
-`eev` was 510999.06 eV and is now 510998.95069, the CODATA 2022 value, and the four places
-that open-coded it as the literal `511000` — `BeamSolver.cpp`, `Collective.cpp`,
-`EFieldSolver.h` and the backend — now use the constant. The name stays `eev` rather than
-becoming something clearer such as `mec2`, because it is upstream's own name with 33 uses in
-25 files, and renaming it would put a conflict in every one of them for no functional gain.
+The inconsistency removed is larger than the CODATA correction: the literal was 1.8e-06 away
+from the constant, the constant 2.1e-07 away from CODATA. Measured on the shipped
+`benchmark/Benchmark1-SASE` deck, master against the branch, the largest amplitude shifts are
+1.8e-05 in `Beam/bunching3`, 2.2e-06 in `Field/intensity-nearfield` and 6.6e-07 in
+`Field/power`; `Beam/bunchingphase3` moves by 2.0e-02 rad, this being a saturated run where
+the third harmonic is the most sensitive thing in the file. GPU and CPU agreement is
+unaffected, since both paths take the value from the same place, and all 62 sweep cases pass.
 
-Every result moves in its seventh significant digit. Measured on the SASE example at 8 ranks,
-old constant against new, the largest shift is 2.6e-06 in `Beam/energyspread` and everything
-else is at or below 7e-07 — three orders of magnitude below the GPU-to-CPU difference. GPU
-and CPU agreement is unaffected, since both paths take the value from the same place.
+**Measuring a "before" build needs a worktree, not a checkout.** `git checkout master` with
+the change staged carries it across, so the first attempt built the new constant into both
+binaries and reported that every dataset was bit-identical. The check that caught it was
+searching each binary for the IEEE-754 pattern of the two values; worth repeating whenever a
+before-and-after claim comes out as exactly zero.
 
 ### Not worth sending
 
