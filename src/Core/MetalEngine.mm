@@ -771,6 +771,21 @@ struct MetalEngine::Impl {
 
     size_t bytes {0};
 
+    // Seconds the device spent executing, summed over every command buffer.
+    // Metal timestamps each one, so this costs nothing and is the only honest
+    // way to tell a GPU that is saturated from a host that is not keeping up:
+    // Genesis' own report is clock(), which counts neither the wait nor the
+    // shader compile, which runs in another process.
+    mutable double busy {0};
+
+    // Every command buffer goes through here, so that the accounting cannot be
+    // forgotten at a new dispatch site.
+    void runAndWait(id<MTLCommandBuffer> cb) const {
+        [cb commit];
+        [cb waitUntilCompleted];
+        busy += [cb GPUEndTime] - [cb GPUStartTime];
+    }
+
     float *fx() const { return (float *)[bX contents]; }
     float *fy() const { return (float *)[bY contents]; }
     float *fpx() const { return (float *)[bPX contents]; }
@@ -794,10 +809,12 @@ bool MetalEngine::available()
     }
 }
 
-std::string MetalEngine::deviceName()
+std::string MetalEngine::deviceName() const
 {
     @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        // p_->dev is only set once init() has run, so fall back to the system
+        // default device, which is the one init() would pick.
+        id<MTLDevice> dev = (p_->dev != nil) ? p_->dev : MTLCreateSystemDefaultDevice();
         if (dev == nil) {
             return std::string("none");
         }
@@ -809,6 +826,7 @@ int MetalEngine::maxBunchHarm() { return kMaxBunchHarm; }
 
 double MetalEngine::gammaRef() const { return p_->gref; }
 size_t MetalEngine::bytesResident() const { return p_->bytes; }
+double MetalEngine::deviceSeconds() const { return p_->busy; }
 
 // The FFT is a four-step decomposition ngrid = regs * lanes. lanes threads
 // cooperate on one transform, each holding regs complex values in registers and
@@ -1175,8 +1193,7 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
         }
 
         [e endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        p_->runAndWait(cb);
     }
 }
 
@@ -1386,8 +1403,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         encTrack(cx * gamma0, cy * gamma0, false);   // second half step
 
         [e endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        p_->runAndWait(cb);
     }
     return true;
 }
@@ -1417,8 +1433,7 @@ bool MetalEngine::beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) co
         [e dispatchThreadgroups:MTLSizeMake(p_->nslice, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [e endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        p_->runAndWait(cb);
     }
 
     const int ns = p_->nslice;
@@ -1531,8 +1546,7 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
         }
 
         [e endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        p_->runAndWait(cb);
     }
 
     out.nslice = ns;

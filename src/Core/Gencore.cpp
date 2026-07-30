@@ -4,10 +4,10 @@
   #include "DiagnosticHookS.h"
 #endif
 
-#ifdef G4_METAL
-  #include "MetalEngine.h"
-  #include <cstdlib>
-#endif
+#include "GPUEngine.h"
+
+#include <chrono>
+#include <memory>
 
 extern bool MPISingle;
 
@@ -29,18 +29,6 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     if (rank==0) {
         cout << endl << "Running Core Simulation..." << endl;
     }
-
-#ifndef G4_METAL
-    // Without the backend compiled in, a deck asking for the GPU would quietly
-    // run on the CPU and the user would believe the timing.
-    if (gpu || gpuValidate) {
-        if (rank==0) {
-            cout << "*** Error: gpu = true in &track, but this binary was built without "
-                    "the GPU backend. Reconfigure with -DENABLE_METAL=ON." << endl;
-        }
-        return false;
-    }
-#endif
 
     //-----------------------------------------
 	// init beam, field and undulator class
@@ -117,30 +105,32 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
     // slippage can keep the backend's copy in step one slice at a time.
     SliceSync *slipSync = nullptr;
 
-#ifdef G4_METAL
     // GPU backend, selected with `gpu = true` in &track. `gpu_validate = true`
     // additionally runs the CPU path every step and reports the largest
     // relative difference; that is a testing mode and is much slower than
     // either path on its own.
-    MetalEngine metal;
-    bool useMetal = gpu || gpuValidate;
-    bool metalDrive = gpu;              // GPU result is the answer
-    bool metalCompare = gpuValidate;    // also run the CPU and diff
-    double metalFieldErr = 0;
-    double metalBeamErr = 0;
-    bool metalBeamOK = false;
-    int metalSteps = 0;
-    int metalFallback = 0;
-    BeamSliceMoments metalBM;
-    vector<FieldSliceMoments> metalFM;
-    auto metalMoments = [&](Beam *b, vector<Field *> *f) -> bool {
-        (void)b;
-        if (!metal.beamMoments(filter.beam.harm, filter.beam.auxiliar, metalBM)) {
+    //
+    // Everything below is written against GPUEngine, so this file contains
+    // nothing device specific and compiles unchanged in a build with no
+    // backend, where create() reports that and the run stops.
+    unique_ptr<GPUEngine> engine;
+    const bool useGPU = gpu || gpuValidate;
+    const bool gpuDrive = gpu;             // GPU result is the answer
+    const bool gpuCompare = gpuValidate;   // also run the CPU and diff
+    double gpuFieldErr = 0;
+    double gpuBeamErr = 0;
+    bool gpuBeamOK = false;
+    int gpuSteps = 0;
+    int gpuFallback = 0;
+    BeamSliceMoments gpuBM;
+    vector<FieldSliceMoments> gpuFM;
+    auto gpuMoments = [&](vector<Field *> *f) -> bool {
+        if (!engine->beamMoments(filter.beam.harm, filter.beam.auxiliar, gpuBM)) {
             return false;
         }
-        metalFM.resize(f->size());
+        gpuFM.resize(f->size());
         for (size_t i = 0; i < f->size(); i++) {
-            if (!metal.fieldMoments(static_cast<int>(i), filter.field.fft, metalFM[i])) {
+            if (!engine->fieldMoments(static_cast<int>(i), filter.field.fft, gpuFM[i])) {
                 return false;
             }
         }
@@ -149,19 +139,19 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 
     // Lets Control::applySlippage move its one slice per slip event without
     // dragging the whole field across.
-    struct MetalSliceSync : public SliceSync {
-        MetalEngine *e {nullptr};
+    struct EngineSliceSync : public SliceSync {
+        GPUEngine *e {nullptr};
         vector<Field *> *f {nullptr};
         void pullSlice(int ifld, int is) override { e->downloadFieldSlice(ifld, is, f->at(ifld)); }
         void pushSlice(int ifld, int is) override { e->uploadFieldSlice(ifld, is, f->at(ifld)); }
-    } metalSync;
-    metalSync.e = &metal;
-    metalSync.f = field;
-    if (useMetal) {
+    } gpuSync;
+    gpuSync.f = field;
+    if (useGPU) {
         string reason;
-        if (!MetalEngine::available()) {
-            reason = "no Metal device with unified memory";
-        } else if (!metal.init(beam, field, reason)) {
+        engine.reset(GPUEngine::create(reason));
+        if (engine == nullptr) {
+            // reason set by create()
+        } else if (!engine->init(beam, field, reason)) {
             // reason set by init()
         } else if (beam->gpuUnsupportedPhysics(reason)) {
             reason += " is not implemented on the GPU yet";
@@ -176,26 +166,31 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
             }
             return false;
         }
-        metal.upload(beam, field);
+        gpuSync.e = engine.get();
+        engine->upload(beam, field);
         // In drive mode the host arrays are no longer the source of truth, so
         // the slippage syncs itself one slice at a time and nothing else copies
         // per step. In compare mode the CPU path runs too and both copies have
         // to be updated the plain way.
-        if (metalDrive && !metalCompare) { slipSync = &metalSync; }
-        MetalEngine::SyncError err = metal.compare(beam, field);
+        if (gpuDrive && !gpuCompare) { slipSync = &gpuSync; }
+        GPUEngine::SyncError err = engine->compare(beam, field);
         if (rank == 0) {
-            cout << "Metal backend: " << MetalEngine::deviceName() << ", "
-                 << metal.bytesResident() / (1024 * 1024) << " MB resident, gamma_ref = "
-                 << metal.gammaRef() << endl;
+            cout << GPUEngine::backend() << " backend: " << engine->deviceName() << ", "
+                 << engine->bytesResident() / (1024 * 1024) << " MB resident, gamma_ref = "
+                 << engine->gammaRef() << endl;
             cout << "  host transfer check: field " << err.field
                  << "   beam " << err.beam << " (relative, FP32 rounding is ~1e-7)" << endl;
-            if (metalCompare) {
+            if (gpuCompare) {
                 cout << "  gpu_validate is on: the CPU path runs as well and the "
                         "difference is reported. This is slow." << endl;
             }
         }
     }
-#endif
+
+    // Wall clock of the tracking loop, for the GPU report at the end of it.
+    // Genesis' own figure is clock(), which counts neither the wait on the
+    // device nor the shader compile, which runs in another process.
+    const auto loopStart = chrono::steady_clock::now();
 
 	/*************/
 	/* MAIN LOOP */
@@ -207,22 +202,20 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ----------------------------------------
 	  // step 1 - apply most marker action  (always at beginning of a step)
 	  bool error_IO=false;
-#ifdef G4_METAL
 	  // A dump reads the host arrays, so the resident copy has to come back
 	  // first. getMarker() reports what is due before applyMarker acts on it:
 	  // bit 1 field dump, bit 2 beam dump, bit 4 sort.
 	  //
 	  // Nothing goes back afterwards. The dump is read-only, and Beam::sort()
-	  // only does anything for one4one, which MetalEngine::init refuses. An
-	  // upload here would be actively wrong in any case: this state is from
-	  // the top of the step, and by the time step 3 runs the GPU has already
-	  // advanced it, so writing it back rolls the beam back one step.
-	  if (metalDrive && !metalCompare) {
+	  // only does anything for one4one, which the backend refuses. An upload
+	  // here would be actively wrong in any case: this state is from the top of
+	  // the step, and by the time step 3 runs the GPU has already advanced it,
+	  // so writing it back rolls the beam back one step.
+	  if (gpuDrive && !gpuCompare) {
 	    const int mk = und->getMarker();
-	    if ((mk & 1) != 0) { metal.downloadField(field); }
-	    if ((mk & 2) != 0) { metal.downloadBeam(beam); }
+	    if ((mk & 1) != 0) { engine->downloadField(field); }
+	    if ((mk & 2) != 0) { engine->downloadBeam(beam); }
 	  }
-#endif
 	  bool sort=control->applyMarker(beam, field, und, error_IO);
 	  if(error_IO) {
 	    return(false);
@@ -232,45 +225,41 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ---------------------------------------
 	  // step 2 - Advance electron beam
 
-#ifdef G4_METAL
-	  if (useMetal) {
+	  if (useGPU) {
 	    string why;
 	    // In drive mode the GPU copy is already the current state; the upload
 	    // is only there to feed the CPU path that compare mode also runs.
-	    if (!metalDrive || metalCompare) { metal.upload(beam, field); }
-	    metalBeamOK = metal.beamStep(beam, und, field, delz, why);
-	    if (!metalBeamOK) {
+	    if (!gpuDrive || gpuCompare) { engine->upload(beam, field); }
+	    gpuBeamOK = engine->beamStep(beam, und, field, delz, why);
+	    if (!gpuBeamOK) {
 	      // Nothing triggers this today, but the path is kept so that an
 	      // element ported later can be refused rather than dropped.
 	      // Falling back needs the host arrays, so bring them over.
-	      if (metalDrive && !metalCompare) { metal.download(beam, field); }
-	      if (metalFallback == 0 && rank == 0) {
-		cout << "  Metal: falling back to the CPU for " << why << " steps" << endl;
+	      if (gpuDrive && !gpuCompare) { engine->download(beam, field); }
+	      if (gpuFallback == 0 && rank == 0) {
+		cout << "  GPU: falling back to the CPU for " << why << " steps" << endl;
 	      }
-	      metalFallback++;
+	      gpuFallback++;
 	    }
 	  }
-	  if (!metalDrive || !metalBeamOK || metalCompare) {
+	  if (!gpuDrive || !gpuBeamOK || gpuCompare) {
 	    beam->track(delz,field,und);
 	  }
-	  if (useMetal) {
-	    if (!metalBeamOK) {
+	  if (useGPU) {
+	    if (!gpuBeamOK) {
 	      // The GPU refused this step and the CPU took it instead, so the host
 	      // now holds the answer. There is nothing to compare, because the only
 	      // difference measured would be the step the GPU did not take, and
 	      // nothing to copy back, because doing so would undo the step.
-	      metal.upload(beam, field);
+	      engine->upload(beam, field);
 	    } else {
-	      if (metalCompare) {
-	        MetalEngine::SyncError e = metal.compare(beam, field);
-	        metalBeamErr = max(metalBeamErr, e.beam);
+	      if (gpuCompare) {
+	        GPUEngine::SyncError e = engine->compare(beam, field);
+	        gpuBeamErr = max(gpuBeamErr, e.beam);
 	      }
-	      if (metalDrive && metalCompare) { metal.downloadBeam(beam); }
+	      if (gpuDrive && gpuCompare) { engine->downloadBeam(beam); }
 	    }
 	  }
-#else
-	  beam->track(delz,field,und);
-#endif
 
 	  // -----------------------------------------
 	  // step 3 - Beam post processing, e.g. sorting
@@ -289,29 +278,23 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  // ---------------------------------------
 	  // step 4 - Advance radiation field
 
-#ifdef G4_METAL
-	  if (useMetal) {
-	    if (!metalDrive || metalCompare) { metal.upload(beam, field); }
-	    metal.fieldStep(und, field, delz);
+	  if (useGPU) {
+	    if (!gpuDrive || gpuCompare) { engine->upload(beam, field); }
+	    engine->fieldStep(und, field, delz);
 	  }
-	  if (!metalDrive || metalCompare) {
+	  if (!gpuDrive || gpuCompare) {
 	    for (int i=0; i<field->size();i++){
 	      field->at(i)->track(delz,beam,und);
 	    }
 	  }
-	  if (useMetal) {
-	    if (metalCompare) {
-	      MetalEngine::SyncError e = metal.compare(beam, field);
-	      metalFieldErr = max(metalFieldErr, e.field);
+	  if (useGPU) {
+	    if (gpuCompare) {
+	      GPUEngine::SyncError e = engine->compare(beam, field);
+	      gpuFieldErr = max(gpuFieldErr, e.field);
 	    }
-	    metalSteps++;
-	    if (metalDrive && metalCompare) { metal.downloadField(field); }
+	    gpuSteps++;
+	    if (gpuDrive && gpuCompare) { engine->downloadField(field); }
 	  }
-#else
-	  for (int i=0; i<field->size();i++){
-	    field->at(i)->track(delz,beam,und);
-	  }
-#endif
 
 
 	  //-----------------------------------------
@@ -330,40 +313,47 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	  //}
 
 	  if (und->outstep()) {
-#ifdef G4_METAL
 	    // The diagnostics are a per-slice reduction over exactly the arrays
 	    // that already live on the GPU, and they dominate the run once the
 	    // tracking is fast: on 500 slices at ngrid=256 they were 76% of the
 	    // wall time. Reduce them there instead of on the host.
-	    if (metalDrive && metalMoments(beam, field)) {
-	      diag.calc(beam, field, und->getz(), &metalBM, &metalFM);
+	    if (gpuDrive && gpuMoments(field)) {
+	      diag.calc(beam, field, und->getz(), &gpuBM, &gpuFM);
 	    } else {
 	      diag.calc(beam, field, und->getz());
 	    }
-#else
-	    diag.calc(beam, field, und->getz());
-#endif
 	  }
 	}
 
-#ifdef G4_METAL
-	if (useMetal) {
+	if (useGPU) {
+	  const double loopSec =
+	      chrono::duration<double>(chrono::steady_clock::now() - loopStart).count();
 	  // The loop kept the state on the GPU; the host owns it again from here,
 	  // for the closing marker action, the output file and whatever namelist
 	  // follows this &track.
-	  if (metalDrive && !metalCompare) { metal.download(beam, field); }
+	  if (gpuDrive && !gpuCompare) { engine->download(beam, field); }
 	  if (rank == 0) {
-	    if (metalCompare) {
-	      cout << "Metal vs CPU over " << metalSteps << " steps: max relative error, field "
-		   << metalFieldErr << ", beam " << metalBeamErr << endl;
+	    // Device busy time against the wall clock of the loop. A device that is
+	    // already saturated will not go faster with more MPI ranks pointed at
+	    // it; one that is idling says the host is the limit.
+	    const double busy = engine->deviceSeconds();
+	    cout << GPUEngine::backend() << ": " << gpuSteps << " steps in " << loopSec
+		 << " s, device busy " << busy << " s";
+	    if (loopSec > 0) {
+	      cout << " (" << static_cast<int>(100.0 * busy / loopSec + 0.5) << "%)";
 	    }
-	    if (metalFallback > 0) {
-	      cout << "Metal: " << metalFallback << " of " << metalSteps
+	    cout << endl;
+	    if (gpuCompare) {
+	      cout << GPUEngine::backend() << " vs CPU over " << gpuSteps
+		   << " steps: max relative error, field "
+		   << gpuFieldErr << ", beam " << gpuBeamErr << endl;
+	    }
+	    if (gpuFallback > 0) {
+	      cout << GPUEngine::backend() << ": " << gpuFallback << " of " << gpuSteps
 		   << " steps fell back to the CPU" << endl;
 	    }
 	  }
 	}
-#endif
      
         //---------------------------
         // end and clean-up 

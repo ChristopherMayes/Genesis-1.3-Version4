@@ -80,8 +80,10 @@ if(USE_DPI)
 endif()
 
 # Apple Silicon GPU backend. Objective-C++, so it needs its own language and the
-# Metal frameworks. Everything is behind the G4_METAL macro, which means a build
-# without this option is bit-identical to the one before it existed.
+# Metal frameworks. The device-specific code is behind the G4_METAL macro, so a
+# build without this option takes exactly the paths it always took: the tracking
+# loop talks to GPUEngine (always compiled, see src/Core/GPUEngine.cpp), which
+# then has no backend to offer it and says so.
 if(ENABLE_METAL)
    if(NOT APPLE)
       message(FATAL_ERROR "ENABLE_METAL requires macOS")
@@ -154,6 +156,7 @@ add_library(genesis13 STATIC
         src/Core/FieldSolverADI.cpp
         src/Core/FieldSolverFFT.cpp
         src/Core/Gencore.cpp
+        src/Core/GPUEngine.cpp
         src/Core/Incoherent.cpp
         src/Core/TrackBeam.cpp
         src/Core/Undulator.cpp

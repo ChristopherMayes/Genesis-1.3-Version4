@@ -1,9 +1,7 @@
 #include "Track.h"
 #include "Gencore.h"
-#ifdef G4_METAL
+#include "GPUEngine.h"
 #include <sstream>
-#include "MetalEngine.h"
-#endif
 
 Track::Track()
 {
@@ -113,13 +111,13 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
   filter.beam.exclharm = exclharm;
   if (output_step < 1) { output_step=1; }
 
-#ifdef G4_METAL
   // Options the GPU backend cannot honour. Each of these would otherwise run
   // to completion and write an output file, having quietly done something
   // other than what the deck asked for, so they are refused here rather than
   // worked around. The check is on the namelist values so that the message can
-  // name the keyword the user actually wrote.
-  if (gpu || gpuValidate) {
+  // name the keyword the user actually wrote. A binary built without a backend
+  // has nothing to check against and lets Gencore report that instead.
+  if ((gpu || gpuValidate) && !GPUEngine::backend().empty()) {
     string clash;
     if (!fftsolver) {
       clash = "the GPU propagates the field by FFT and has no ADI solver, so "
@@ -128,10 +126,10 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
       clash = "source_filter is not implemented on the GPU. The GPU field solve "
               "drops one of the three transforms, which is exact only while the "
               "source term is unfiltered";
-    } else if (bunchharm > MetalEngine::maxBunchHarm()) {
+    } else if (bunchharm > GPUEngine::maxBunchHarm()) {
       stringstream ss;
       ss << "bunchharm = " << bunchharm << ", but the GPU diagnostic reduction "
-         << "goes up to " << MetalEngine::maxBunchHarm()
+         << "goes up to " << GPUEngine::maxBunchHarm()
          << ". The particles stay on the GPU, so there is no host copy to "
             "compute the higher harmonics from";
       clash = ss.str();
@@ -143,7 +141,6 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
       return false;
     }
   }
-#endif
 
   // select solver
 #ifndef FFTW

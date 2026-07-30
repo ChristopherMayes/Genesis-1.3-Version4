@@ -382,9 +382,11 @@ def render(case, name, gpu):
     return text
 
 
+# The backend names itself in both lines, so these match whichever one the
+# binary was built with rather than Metal specifically.
 ERR_LINE = re.compile(
-    r"Metal vs CPU over (\d+) steps: max relative error, field (\S+), beam (\S+)")
-FALLBACK = re.compile(r"Metal: (\d+) of (\d+) steps fell back")
+    r"\w+ vs CPU over (\d+) steps: max relative error, field (\S+), beam (\S+)")
+FALLBACK = re.compile(r"\w+: (\d+) of (\d+) steps fell back")
 
 
 def run(genesis, mpirun, workdir, case, name, gpu, ranks):
