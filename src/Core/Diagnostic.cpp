@@ -512,63 +512,63 @@ void DiagBeam::getValues(Beam *beam,std::map<std::string,std::vector<double> >&v
                 gmin = pre->gmin[is];   gmax = pre->gmax[is];
             }
         } else {
-        for (auto const &par: slice) {
-            x1 += par.x;
-            x2 += par.x * par.x;
-            y1 += par.y;
-            y2 += par.y * par.y;
-            g1 += par.gamma;
-            g2 += par.gamma * par.gamma;
-            px1 += par.px;
-            py1 += par.py;
-            px2 += par.px * par.px;
-            py2 += par.py * par.py;
-            xpx += par.x * par.px;
-            ypy += par.y * par.py;
-//           complex<double> phasor = complex<double> (cos(par.theta),sin(par.theta));
-//           complex<double> phasor_acc = phasor;
-//           b[0] += phasor;
-            for (int iharm = 0; iharm < nharm; iharm++) {
-                //              phasor_acc *= phasor;
-//               b[iharm]+=phasor_acc;
-                b[iharm] += complex<double>(cos((iharm + 1) * par.theta), sin((iharm + 1) * par.theta));
-//                b[iharm]+=phasor*phasor;
-            }
-        }
-        if (wantAux) {
             for (auto const &par: slice) {
-                if (par.x < xmin) { xmin = par.x; }
-                if (par.x > xmax) { xmax = par.x; }
-                if (par.px < pxmin) { pxmin = par.px; }
-                if (par.px > pxmax) { pxmax = par.px; }
-                if (par.y < ymin) { ymin = par.y; }
-                if (par.y > ymax) { ymax = par.y; }
-                if (par.py < pymin) { pymin = par.py; }
-                if (par.py > pymax) { pymax = par.py; }
-                if (par.gamma < gmin) { gmin = par.gamma; }
-                if (par.gamma > gmax) { gmax = par.gamma; }
+                x1 += par.x;
+                x2 += par.x * par.x;
+                y1 += par.y;
+                y2 += par.y * par.y;
+                g1 += par.gamma;
+                g2 += par.gamma * par.gamma;
+                px1 += par.px;
+                py1 += par.py;
+                px2 += par.px * par.px;
+                py2 += par.py * par.py;
+                xpx += par.x * par.px;
+                ypy += par.y * par.py;
+    //           complex<double> phasor = complex<double> (cos(par.theta),sin(par.theta));
+    //           complex<double> phasor_acc = phasor;
+    //           b[0] += phasor;
+                for (int iharm = 0; iharm < nharm; iharm++) {
+                    //              phasor_acc *= phasor;
+    //               b[iharm]+=phasor_acc;
+                    b[iharm] += complex<double>(cos((iharm + 1) * par.theta), sin((iharm + 1) * par.theta));
+    //                b[iharm]+=phasor*phasor;
+                }
             }
-        }
-        double norm = 1.;
-        if (!slice.empty()) {
-            norm = 1. / static_cast<double>(slice.size());
-        }
-        // normalize the values
-        x1 *= norm;
-        x2 *= norm;
-        y1 *= norm;
-        y2 *= norm;
-        px1 *= norm;
-        px2 *= norm;
-        py1 *= norm;
-        py2 *= norm;
-        g1 *= norm;
-        g2 *= norm;
-        xpx *= norm;
-        ypy *= norm;
-        for (int iharm = 0; iharm < nharm; iharm++) {
-            b[iharm] *= norm;
-        }
+            if (wantAux) {
+                for (auto const &par: slice) {
+                    if (par.x < xmin) { xmin = par.x; }
+                    if (par.x > xmax) { xmax = par.x; }
+                    if (par.px < pxmin) { pxmin = par.px; }
+                    if (par.px > pxmax) { pxmax = par.px; }
+                    if (par.y < ymin) { ymin = par.y; }
+                    if (par.y > ymax) { ymax = par.y; }
+                    if (par.py < pymin) { pymin = par.py; }
+                    if (par.py > pymax) { pymax = par.py; }
+                    if (par.gamma < gmin) { gmin = par.gamma; }
+                    if (par.gamma > gmax) { gmax = par.gamma; }
+                }
+            }
+            double norm = 1.;
+            if (!slice.empty()) {
+                norm = 1. / static_cast<double>(slice.size());
+            }
+            // normalize the values
+            x1 *= norm;
+            x2 *= norm;
+            y1 *= norm;
+            y2 *= norm;
+            px1 *= norm;
+            px2 *= norm;
+            py1 *= norm;
+            py2 *= norm;
+            g1 *= norm;
+            g2 *= norm;
+            xpx *= norm;
+            ypy *= norm;
+            for (int iharm = 0; iharm < nharm; iharm++) {
+                b[iharm] *= norm;
+            }
         }
 
         //-------------------------------------------------------------------------------
