@@ -778,12 +778,54 @@ struct MetalEngine::Impl {
     // shader compile, which runs in another process.
     mutable double busy {0};
 
-    // Every command buffer goes through here, so that the accounting cannot be
-    // forgotten at a new dispatch site.
-    void runAndWait(id<MTLCommandBuffer> cb) const {
+    // One command buffer is kept open and every dispatch of a step is encoded
+    // into it, because submitting a command buffer costs far more than adding a
+    // dispatch to one. On the 500-slice example, where a step is 19 ms of real
+    // work, the difference is 2%. On a steady-state deck, where a step is one
+    // slice, it is the whole cost: four submissions per step took 3.5 ms per
+    // step, one takes 0.99 ms, and the same 1104-step deck went from 3.9 s to
+    // 1.1 s -- from slightly slower than the CPU to three times faster.
+    //
+    // The buffer is committed and waited for in sync(), and nothing else
+    // commits, so no GPU work is ever in flight while the host is looking at
+    // the buffers. That is what makes the small per-slice arrays safe to
+    // overwrite at the head of the next step without any double buffering.
+    mutable id<MTLCommandBuffer> cb {nil};
+    mutable id<MTLComputeCommandEncoder> enc {nil};
+    mutable int encoded {0};
+
+    // Backstop, counted in calls that encoded something rather than in
+    // dispatches. In practice the head of every beam step drains the buffer, so
+    // it never holds more than one step's work; this is only here so that a
+    // future caller that never reads anything back cannot pile up without
+    // bound.
+    static const int kMaxEncoded = 64;
+
+    id<MTLComputeCommandEncoder> encoder() const {
+        if (enc == nil) {
+            cb = [queue commandBuffer];
+            enc = [cb computeCommandEncoder];
+            encoded = 0;
+        }
+        encoded++;
+        return enc;
+    }
+
+    // Everything the host does to a buffer -- reading a reduction, uploading,
+    // downloading, comparing -- goes through here first.
+    void sync() const {
+        if (enc == nil) { return; }
+        [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
         busy += [cb GPUEndTime] - [cb GPUStartTime];
+        enc = nil;
+        cb = nil;
+        encoded = 0;
+    }
+
+    void syncIfFull() const {
+        if (encoded >= kMaxEncoded) { sync(); }
     }
 
     float *fx() const { return (float *)[bX contents]; }
@@ -798,6 +840,9 @@ MetalEngine::MetalEngine() : p_(new Impl) {}
 
 MetalEngine::~MetalEngine()
 {
+    // An encoder left open is a Metal error on release, and a &track block that
+    // ends without a download would otherwise drop the work it had encoded.
+    if (p_ != nullptr) { p_->sync(); }
     delete p_;
 }
 
@@ -1085,8 +1130,7 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
         const int istep = und->getStep();
         const float fwd = 1.0f, inv = -1.0f, one = 1.0f;
 
-        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = p_->encoder();
 
         for (size_t ih = 0; ih < p_->bField.size(); ih++) {
             Field *f = field->at(ih);
@@ -1094,8 +1138,11 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
             const size_t nn = static_cast<size_t>(ng) * ng;
             const float nrm = 1.0f / static_cast<float>(nn);
 
-            // exp(K2*delz) only changes when the step length does.
+            // exp(K2*delz) only changes when the step length does. The host
+            // writes it, so anything already encoded has to be out of the way,
+            // and the encoder has to be reopened afterwards.
             if (p_->delzCached[ih] != delz) {
+                p_->sync();
                 std::complex<float> *K =
                     (std::complex<float> *)[p_->bExpK[ih] contents];
                 const double dk = 4.0 * asin(1.0) / (ng * f->dgrid);
@@ -1114,6 +1161,7 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
                     }
                 }
                 p_->delzCached[ih] = delz;
+                e = p_->encoder();
             }
 
             // Zero the source, then deposit if this harmonic couples. Even
@@ -1191,10 +1239,8 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
             [e setBuffer:p_->bSrc offset:0 atIndex:4];
             [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
         }
-
-        [e endEncoding];
-        p_->runAndWait(cb);
     }
+    p_->syncIfFull();
 }
 
 bool MetalEngine::beamStep(Beam *beam, Undulator *und,
@@ -1312,6 +1358,12 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         }
         P.xku = static_cast<float>(xku);
 
+        // The two arrays below are written by the host and read by dispatches
+        // encoded in this step, so anything encoded by the previous step -- and
+        // still only encoded, since nothing but sync() commits -- has to be got
+        // out of the way first. This is the one sync a step always performs.
+        p_->sync();
+
         // Long-range space charge, in units of the electron rest mass. Zero
         // unless the space-charge solver is switched on.
         float *ez = (float *)[p_->bEZ contents];
@@ -1336,8 +1388,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             }
         }
 
-        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = p_->encoder();
 
         // setBytes copies at encode time, so T can be reused for both halves.
         auto encTrack = [&](double kickx, double kicky, bool map) {
@@ -1401,10 +1452,8 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         // TrackBeam::track applies the corrector on the closing half step only,
         // which is why the kick is attached here and not to the opening one.
         encTrack(cx * gamma0, cy * gamma0, false);   // second half step
-
-        [e endEncoding];
-        p_->runAndWait(cb);
     }
+    p_->syncIfFull();
     return true;
 }
 
@@ -1419,8 +1468,7 @@ bool MetalEngine::beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) co
         P.nharm = static_cast<uint32_t>(nharm);
         P.doAux = wantAux ? 1u : 0u;
 
-        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = p_->encoder();
         [e setComputePipelineState:p_->pBM];
         [e setBuffer:p_->bX offset:0 atIndex:0];
         [e setBuffer:p_->bY offset:0 atIndex:1];
@@ -1432,9 +1480,9 @@ bool MetalEngine::beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) co
         [e setBytes:&P length:sizeof(P) atIndex:7];
         [e dispatchThreadgroups:MTLSizeMake(p_->nslice, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [e endEncoding];
-        p_->runAndWait(cb);
     }
+    // The host reads the result immediately below.
+    p_->sync();
 
     const int ns = p_->nslice;
     out.nslice = ns;
@@ -1506,8 +1554,7 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
         const MTLSize slices = MTLSizeMake(ns, 1, 1);
         const MTLSize tg = MTLSizeMake(256, 1, 1);
 
-        id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> e = p_->encoder();
 
         [e setComputePipelineState:p_->pFM];
         [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
@@ -1544,10 +1591,9 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
             [e setBytes:&F length:sizeof(F) atIndex:2];
             [e dispatchThreadgroups:slices threadsPerThreadgroup:tg];
         }
-
-        [e endEncoding];
-        p_->runAndWait(cb);
     }
+    // The host reads the result immediately below.
+    p_->sync();
 
     out.nslice = ns;
     out.hasFar = wantFar;
@@ -1587,6 +1633,9 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
     return true;
 }
 
+// Everything from here on touches the buffers from the host, so each of these
+// first drains whatever is encoded. See Impl::sync().
+
 void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
 {
     this->uploadBeam(beam);
@@ -1606,6 +1655,7 @@ void MetalEngine::upload(Beam *beam, std::vector<Field *> *field)
 
 void MetalEngine::uploadBeam(Beam *beam)
 {
+    p_->sync();
     const int ns = p_->nslice, np = p_->npart;
     float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
     float *g = p_->fg(), *t = p_->ft();
@@ -1632,6 +1682,7 @@ void MetalEngine::uploadBeam(Beam *beam)
 
 void MetalEngine::download(Beam *beam, std::vector<Field *> *field)
 {
+    p_->sync();
     const int ns = p_->nslice, np = p_->npart;
     const float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
     const float *g = p_->fg(), *t = p_->ft();
@@ -1666,6 +1717,7 @@ void MetalEngine::download(Beam *beam, std::vector<Field *> *field)
 
 void MetalEngine::downloadField(std::vector<Field *> *field)
 {
+    p_->sync();
     for (size_t i = 0; i < p_->bField.size(); i++) {
         const size_t nn = static_cast<size_t>(p_->ngrid[i]) * p_->ngrid[i];
         const std::complex<float> *src =
@@ -1685,6 +1737,7 @@ void MetalEngine::downloadField(std::vector<Field *> *field)
 // rest of the grid stays resident.
 void MetalEngine::downloadFieldSlice(int ifld, int islice, Field *field)
 {
+    p_->sync();
     if (ifld < 0 || static_cast<size_t>(ifld) >= p_->bField.size()) { return; }
     if (islice < 0 || islice >= p_->nslice) { return; }
     const size_t nn = static_cast<size_t>(p_->ngrid[ifld]) * p_->ngrid[ifld];
@@ -1699,6 +1752,7 @@ void MetalEngine::downloadFieldSlice(int ifld, int islice, Field *field)
 
 void MetalEngine::uploadFieldSlice(int ifld, int islice, const Field *field)
 {
+    p_->sync();
     if (ifld < 0 || static_cast<size_t>(ifld) >= p_->bField.size()) { return; }
     if (islice < 0 || islice >= p_->nslice) { return; }
     const size_t nn = static_cast<size_t>(p_->ngrid[ifld]) * p_->ngrid[ifld];
@@ -1713,6 +1767,7 @@ void MetalEngine::uploadFieldSlice(int ifld, int islice, const Field *field)
 
 void MetalEngine::downloadBeam(Beam *beam)
 {
+    p_->sync();
     const int ns = p_->nslice, np = p_->npart;
     const float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
     const float *g = p_->fg(), *t = p_->ft();
@@ -1735,6 +1790,7 @@ void MetalEngine::downloadBeam(Beam *beam)
 MetalEngine::SyncError MetalEngine::compare(Beam *beam,
                                             std::vector<Field *> *field) const
 {
+    p_->sync();
     SyncError e;
     const int ns = p_->nslice, np = p_->npart;
     const float *x = p_->fx(), *y = p_->fy(), *px = p_->fpx(), *py = p_->fpy();
