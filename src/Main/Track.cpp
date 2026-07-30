@@ -1,5 +1,9 @@
 #include "Track.h"
 #include "Gencore.h"
+#ifdef G4_METAL
+#include <sstream>
+#include "MetalEngine.h"
+#endif
 
 Track::Track()
 {
@@ -108,6 +112,38 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
   filter.beam.harm = bunchharm;
   filter.beam.exclharm = exclharm;
   if (output_step < 1) { output_step=1; }
+
+#ifdef G4_METAL
+  // Options the GPU backend cannot honour. Each of these would otherwise run
+  // to completion and write an output file, having quietly done something
+  // other than what the deck asked for, so they are refused here rather than
+  // worked around. The check is on the namelist values so that the message can
+  // name the keyword the user actually wrote.
+  if (gpu || gpuValidate) {
+    string clash;
+    if (!fftsolver) {
+      clash = "the GPU propagates the field by FFT and has no ADI solver, so "
+              "fft_fieldsolver = true is required";
+    } else if (doFilter) {
+      clash = "source_filter is not implemented on the GPU. The GPU field solve "
+              "drops one of the three transforms, which is exact only while the "
+              "source term is unfiltered";
+    } else if (bunchharm > MetalEngine::maxBunchHarm()) {
+      stringstream ss;
+      ss << "bunchharm = " << bunchharm << ", but the GPU diagnostic reduction "
+         << "goes up to " << MetalEngine::maxBunchHarm()
+         << ". The particles stay on the GPU, so there is no host copy to "
+            "compute the higher harmonics from";
+      clash = ss.str();
+    }
+    if (!clash.empty()) {
+      if (rank == 0) {
+        cout << "*** Error: gpu = true in &track, but " << clash << endl;
+      }
+      return false;
+    }
+  }
+#endif
 
   // select solver
 #ifndef FFTW

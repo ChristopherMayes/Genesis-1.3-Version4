@@ -112,11 +112,21 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 |---|---|
 | `ngrid` | a power of two from **64 to 1024** |
 | field harmonics | up to 4, all sharing the same `ngrid`, `dgrid` and `gridmax` |
-| bunching harmonics | up to 8; beyond that the diagnostics fall back to the CPU |
+| `bunchharm` | up to 8 |
+| `fft_fieldsolver` | must be `true`; there is no ADI solver on the GPU |
+| `source_filter` | not supported |
 | `one4one` | not supported; the backend wants a rectangular particle array |
 | chicanes, correctors | that one step falls back to the CPU and is reported once |
 | wakefields (`&wake`) | supported, including the resistive wall |
 | ISR, short-range space charge | hard error |
+
+Everything in that table that is not supported is a hard error rather than a
+fallback. The reason is the same in each case: the alternative is a run that
+completes and writes a plausible output file having quietly done something
+other than what the deck asked for. `source_filter` would be ignored, an ADI
+deck would be propagated by FFT instead, and a `bunchharm` above 8 would be
+answered from host particle arrays that are stale, because the particles stay
+on the GPU. None of those announce themselves in the output file.
 
 The `ngrid` restriction is the awkward one. Genesis decks traditionally use an
 odd `ngrid` so that a grid point sits exactly on axis, but that convention buys
@@ -147,15 +157,30 @@ not saturate the GPU, and from 256 upwards each doubling costs about 2.6x, then
 range because a host-side diagnostic bug dominated every configuration; see the
 performance notes below.
 
-Agreement with the CPU degrades gently with grid size, because the transform is
-single precision and a larger grid means more rounding steps in each butterfly
-chain. Over the 1104 steps of the validation deck the largest relative field
-difference is 9.2e-6 at `ngrid = 64`, 2.3e-4 at 256 and 8.5e-3 at 1024; the
-beam moments stay at 3.2e-6 throughout.
+Agreement with the CPU degrades with grid size, but the grid is not really the
+cause. Over the 1104 steps of the validation deck, holding `npart` at 8192, the
+largest relative field difference is 9.4e-6 at `ngrid = 64`, 2.3e-4 at 256 and
+8.5e-3 at 1024. What changes across that row is how many particles land in each
+cell. A bilinear deposition of a fixed number of particles onto a finer mesh
+leaves more shot noise in the source term, and that noise is high spatial
+frequency, which is where single precision is weakest. Raising `npart` at fixed
+`ngrid = 1024` brings the difference back down:
 
-Note that the field solver on the GPU is always the FFT one. `fft_fieldsolver`
-in `&track` only selects the CPU solver, so it makes no difference to a
-`gpu = true` run, but it does need to be set on both sides of any comparison.
+| `npart` | field difference |
+|---|---|
+| 8192 | 8.5e-03 |
+| 32768 | 3.2e-03 |
+| 131072 | 1.2e-03 |
+
+So the rule is to scale `npart` with `ngrid` rather than to distrust the large
+grids. A deck that puts a handful of particles in each cell is under-resolved
+in double precision too; single precision merely makes it visible. The beam
+moments are unaffected and stay at 3.2e-6 throughout, because they are a
+reduction over particles and never touch the grid.
+
+The field solver on the GPU is always the FFT one, and `fft_fieldsolver = true`
+is required rather than assumed: a `gpu = true` run with the ADI solver selected
+is refused, so that a deck cannot be propagated by a method it did not ask for.
 
 ### Wakefields
 

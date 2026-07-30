@@ -253,15 +253,19 @@ bool Gencore::run(Beam *beam, vector<Field*> *field, Setup *setup, Undulator *un
 	    beam->track(delz,field,und);
 	  }
 	  if (useMetal) {
-	    if (!metalBeamOK && metalDrive && !metalCompare) {
-	      // The CPU did this step; hand the result back to the GPU.
+	    if (!metalBeamOK) {
+	      // The GPU refused this step and the CPU took it instead, so the host
+	      // now holds the answer. There is nothing to compare, because the only
+	      // difference measured would be the step the GPU did not take, and
+	      // nothing to copy back, because doing so would undo the step.
 	      metal.upload(beam, field);
+	    } else {
+	      if (metalCompare) {
+	        MetalEngine::SyncError e = metal.compare(beam, field);
+	        metalBeamErr = max(metalBeamErr, e.beam);
+	      }
+	      if (metalDrive && metalCompare) { metal.downloadBeam(beam); }
 	    }
-	    if (metalCompare) {
-	      MetalEngine::SyncError e = metal.compare(beam, field);
-	      metalBeamErr = max(metalBeamErr, e.beam);
-	    }
-	    if (metalDrive && metalCompare) { metal.downloadBeam(beam); }
 	  }
 #else
 	  beam->track(delz,field,und);

@@ -39,6 +39,12 @@ class MetalEngine {
     static bool available();
     static std::string deviceName();
 
+    // Highest bunching harmonic the diagnostic reduction can produce. Above it
+    // the reduction has no answer, and because the host arrays are stale while
+    // the beam is resident there is nothing to fall back on, so &track has to
+    // refuse the deck rather than report bunching computed from old particles.
+    static int maxBunchHarm();
+
     // Allocates the resident buffers for this run. Returns false and fills
     // 'reason' if the configuration is not supported, in which case the caller
     // must keep using the CPU path.

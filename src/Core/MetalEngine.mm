@@ -754,6 +754,8 @@ std::string MetalEngine::deviceName()
     }
 }
 
+int MetalEngine::maxBunchHarm() { return kMaxBunchHarm; }
+
 double MetalEngine::gammaRef() const { return p_->gref; }
 size_t MetalEngine::bytesResident() const { return p_->bytes; }
 
