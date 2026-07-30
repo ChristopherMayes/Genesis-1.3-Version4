@@ -470,6 +470,7 @@ kernel void deposit(device atomic_float* src [[buffer(0)]],
 
 struct TrkPar {
     float delz, aw, qx, qy, xoff, yoff, gref;
+    float cpx, cpy;        // corrector kick, already scaled by gamma_ref
     uint  mx, my;          // 0 = drift, 1 = focusing, 2 = defocusing
 };
 
@@ -479,7 +480,10 @@ kernel void track_beam(device float* X  [[buffer(0)]], device float* Y  [[buffer
                        constant TrkPar& P [[buffer(5)]],
                        uint gid [[thread_position_in_grid]]){
     float gam = P.gref + G[gid];
-    float px = PX[gid], py = PY[gid];
+    // TrackBeam::applyCorrector runs before the transverse map and therefore
+    // before gamma*beta_z is formed, so the kick is added here rather than to
+    // the stored momenta afterwards.
+    float px = PX[gid] + P.cpx, py = PY[gid] + P.cpy;
     // gamma*beta_z. Written as gamma*sqrt(1-r) rather than
     // sqrt(gamma^2-1-aw^2-p^2): at gamma = 11357 the FP32 quantum of gamma^2 is
     // 15, so the O(1) terms would be lost completely in the subtraction.
@@ -650,6 +654,7 @@ struct DepPar {
 
 struct TrkPar {
     float delz, aw, qx, qy, xoff, yoff, gref;
+    float cpx, cpy;
     uint32_t mx, my;
 };
 
@@ -1141,10 +1146,6 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         reason = "chicane";
         return false;
     }
-    if (cx != 0 || cy != 0) {
-        reason = "corrector";
-        return false;
-    }
     if (beam->gpuUnsupportedPhysics(reason)) {
         return false;
     }
@@ -1259,7 +1260,10 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         id<MTLCommandBuffer> cb = [p_->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
 
-        auto encTrack = [&]() {
+        // setBytes copies at encode time, so T can be reused for both halves.
+        auto encTrack = [&](double kickx, double kicky) {
+            T.cpx = static_cast<float>(kickx);
+            T.cpy = static_cast<float>(kicky);
             [e setComputePipelineState:p_->pTrk];
             [e setBuffer:p_->bX offset:0 atIndex:0];
             [e setBuffer:p_->bY offset:0 atIndex:1];
@@ -1270,7 +1274,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e dispatchThreads:grid threadsPerThreadgroup:tg];
         };
 
-        encTrack();   // first half step
+        encTrack(0, 0);   // first half step
 
         [e setComputePipelineState:p_->pPush];
         [e setBuffer:p_->bG offset:0 atIndex:0];
@@ -1298,7 +1302,9 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             [e dispatchThreads:grid threadsPerThreadgroup:tg];
         }
 
-        encTrack();   // second half step
+        // TrackBeam::track applies the corrector on the closing half step only,
+        // which is why the kick is attached here and not to the opening one.
+        encTrack(cx * gamma0, cy * gamma0);   // second half step
 
         [e endEncoding];
         [cb commit];

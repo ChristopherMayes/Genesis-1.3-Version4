@@ -246,7 +246,11 @@ case("output_step_5", edit={"track.output_step": 5})
 
 # -- the CPU fallback path --------------------------------------------------
 case("chicane", lat=LAT_CHICANE, expect="fallback")
-case("corrector", lat=LAT_CORRECTOR, expect="fallback")
+
+# The corrector kick runs on the GPU, so this case has to stay on it for every
+# step. It is kept next to the chicane because the two elements enter the step
+# through the same branch of TrackBeam::track.
+case("corrector", lat=LAT_CORRECTOR)
 
 # -- time dependent ---------------------------------------------------------
 e, kw = td()
@@ -466,6 +470,12 @@ def main():
                     fb = FALLBACK.search(out)
                     if c.expect == "fallback" and not fb:
                         verdict = "expected a CPU fallback and got none"
+                    elif fb and c.expect != "fallback":
+                        # Silently dropping to the CPU is a correct answer
+                        # obtained the slow way, and it hides an unported
+                        # element, so it counts as a failure here.
+                        verdict = "UNEXPECTED CPU FALLBACK, %s/%s steps" % (
+                            fb.group(1), fb.group(2))
                     elif field > args.field_tol or beam > args.beam_tol:
                         verdict = "OVER TOLERANCE"
                     else:

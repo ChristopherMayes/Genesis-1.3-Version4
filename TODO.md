@@ -113,15 +113,21 @@ Two lessons about the harness itself are worth keeping:
       `Beam/energy` 4.0e-10, `Beam/bunching` 3.5e-04, `Field/power` 1.7e-04, against a wake
       effect of 4.0e-05, 8.5e-03 and 2.8e-03 respectively.
 - [ ] Port `Incoherent` and short-range space charge (hard error today)
-- [ ] **Port the corrector kick.** This is now the highest-value remaining item, ahead of
-      `applyR56`. `MetalEngine::beamStep` refuses any step with a non-zero `cx` or `cy`, and
-      `orbiterror = true` is implemented as a per-step corrector, so a deck with undulator
-      orbit errors puts **187 of 196 steps back on the CPU** and gets almost no benefit from
-      the GPU. Orbit errors are a routine part of a realistic deck, so this is not an edge
-      case. The work is small: `TrackBeam::applyCorrector` is `px += cx*gamma0`,
-      `py += cy*gamma0` over every particle, so it is a constant addition folded into the
-      existing beam step. `applyR56` for chicanes is the natural companion and is a single
-      shear in the same kernel.
+- [x] **Port the corrector kick.** `MetalEngine::beamStep` used to refuse any step with a
+      non-zero `cx` or `cy`, and `orbiterror = true` is implemented as a per-step corrector,
+      so a deck with undulator orbit errors put 187 of 196 steps back on the CPU and got
+      almost no benefit from the GPU. The kick is a constant addition to the momenta, so it
+      is now two more fields in `TrkPar` applied at the head of `track_beam`, with no extra
+      dispatch. It has to be added before gamma*beta_z is formed and only on the closing half
+      step, which is where `TrackBeam::track` calls `applyCorrector`. The `orbit_error` case
+      now stays on the GPU for all 196 steps at a per-step field difference of 4.6e-04, and
+      the sweep treats any unexpected fallback as a failure so that a future regression here
+      cannot hide behind a correct answer. On a 400-slice orbit-error deck at 8 ranks the run
+      goes from 25.2 s to 9.4 s against 46.2 s on the CPU, so the speedup over the CPU rises
+      from 1.8x to 4.9x. A refused step costs more than a CPU step, because the particles and
+      the field have to make the round trip either side of it. `applyR56` for chicanes is the
+      natural companion and is still outstanding; the `chicane` case is the one remaining
+      fallback, and a lattice holds a handful of chicanes rather than one per step.
 - [ ] `one4one` is refused outright (the GPU wants a rectangular particle array)
 - [x] Host-side diagnostic assembly. It was ~5 s of the 7.4 s single-rank time. Most of it was
       not `storeValue` at all but `DiagBeamUser::getValues`, which evaluated a `sin`/`cos` per

@@ -116,7 +116,8 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 | `fft_fieldsolver` | must be `true`; there is no ADI solver on the GPU |
 | `source_filter` | not supported |
 | `one4one` | not supported; the backend wants a rectangular particle array |
-| chicanes, correctors | that one step falls back to the CPU and is reported once |
+| correctors | supported; the kick rides on the closing half step |
+| chicanes | that one step falls back to the CPU and is reported once |
 | wakefields (`&wake`) | supported, including the resistive wall |
 | ISR, short-range space charge | hard error |
 
@@ -360,6 +361,22 @@ claimed 2.9x at four ranks and 3.8x at eight, and explained it as host
 diagnostic work overlapping GPU work. That explanation was correct about the
 mechanism but the host work in question was almost entirely a bug, and with it
 fixed the effect largely disappears.
+
+**One fallback step costs more than it looks.** A step the GPU refuses is not
+merely a step taken at CPU speed: the particles and the field have to come back
+to the host before it and go out again afterwards, so the step is slower than
+it would have been on the CPU alone. Correctors used to be refused, and since
+`orbiterror = true` is implemented as a corrector at every step, an orbit-error
+deck spent 187 of its 196 steps that way. On a 400-slice run at eight ranks:
+
+| | wall clock |
+|---:|---:|
+| CPU | 46.2 s |
+| GPU, correctors refused | 25.2 s |
+| GPU, correctors ported | 9.4 s |
+
+Correctors now run on the GPU. A chicane is the one element still refused, and
+a lattice normally holds a handful of them rather than one per step.
 
 **`export FI_PROVIDER=tcp` is not optional** if you are using conda's MPICH on
 macOS. The default libfabric provider busy-polls while waiting, and the faster

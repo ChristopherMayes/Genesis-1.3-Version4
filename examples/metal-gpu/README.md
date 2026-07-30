@@ -112,6 +112,8 @@ it. A missed transfer is a finite error rather than a round-off one, so it goes
 straight through the bound.
 
 Every case is checked against what it is supposed to do, so the runs that are
-*expected* to fail count as passes: `chicane` and `corrector` must report
-exactly one step falling back to the CPU, and the ten `refuse_*` cases must
-each die with the error message that names the keyword at fault.
+*expected* to fail count as passes: `chicane` must report exactly one step
+falling back to the CPU, and the ten `refuse_*` cases must each die with the
+error message that names the keyword at fault. Every other case must stay on
+the GPU for the whole run, and a fallback where none is expected is a failure,
+since it would otherwise hide an unported element behind a correct answer.
