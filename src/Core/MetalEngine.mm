@@ -185,6 +185,24 @@ kernel void fft_rows(device float2* d [[buffer(0)]], const device float2* W [[bu
     for (uint cc=0;cc<CHUNK;cc++)
         for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
 }
+// Out-of-place row pass: reads one buffer, writes another. The far-field
+// diagnostic needs the transform of a slice while the slice itself has to
+// survive, and doing the first pass out of place is free, where copying the
+// whole field first costs a read and a write of every point.
+kernel void fft_rows_out(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+                         constant float& sgn [[buffer(2)]], const device float2* s0 [[buffer(3)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
+    threadgroup float2 sh[RF_ROWS*NG];
+    uint lane = t % LANES, r = t / LANES;
+    ulong off = (ulong)tg.y*((ulong)N*N) + (ulong)(tg.x*RF_ROWS + r)*N;
+    device float2* p = d + off;
+    const device float2* q = s0 + off;
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = q[LANES*n1 + lane];
+    fftN(a, sh + r*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
+}
 kernel void fft_rows_mul(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                          constant float& sgn [[buffer(2)]], const device float2* expK [[buffer(3)]],
                          uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
@@ -397,12 +415,6 @@ kernel void field_moments(const device float2* F [[buffer(0)]],
         r[0]=p; r[1]=sx; r[2]=sy; r[3]=cx; r[4]=cy;
         if (P.isfar == 0u){ r[5]=fr; r[6]=fi; }
     }
-}
-
-kernel void copy_field(device float2* dst [[buffer(0)]],
-                       const device float2* src [[buffer(1)]],
-                       uint i [[thread_position_in_grid]]){
-    dst[i] = src[i];
 }
 
 // ---------------- source deposition ----------------
@@ -754,8 +766,8 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bBM {nil};
     id<MTLBuffer> bFM {nil};
 
-    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pCol, pColA, pTrk, pPush;
-    id<MTLComputePipelineState> pBM, pFM, pCopy, pELoss, pR56;
+    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pRowO, pCol, pColA, pTrk, pPush;
+    id<MTLComputePipelineState> pBM, pFM, pELoss, pR56;
 
     size_t bytes {0};
 
@@ -1031,13 +1043,13 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pDep = pso(@"deposit");
     p_->pRow = pso(@"fft_rows");
     p_->pRowM = pso(@"fft_rows_mul");
+    p_->pRowO = pso(@"fft_rows_out");
     p_->pCol = pso(@"fft_cols");
     p_->pColA = pso(@"fft_cols_add");
     p_->pTrk = pso(@"track_beam");
     p_->pPush = pso(@"push_beam");
     p_->pBM = pso(@"beam_moments");
     p_->pFM = pso(@"field_moments");
-    p_->pCopy = pso(@"copy_field");
     p_->pELoss = pso(@"apply_eloss");
     p_->pR56 = pso(@"apply_r56");
     if (!ok) {
@@ -1489,17 +1501,16 @@ bool MetalEngine::fieldMoments(int ih, bool wantFar, FieldSliceMoments &out) con
         [e dispatchThreadgroups:slices threadsPerThreadgroup:tg];
 
         if (wantFar) {
-            // The near field has to survive, so transform a copy. bSrc is only
-            // live inside fieldStep, so it is free to borrow here.
-            [e setComputePipelineState:p_->pCopy];
-            [e setBuffer:p_->bSrc offset:0 atIndex:0];
-            [e setBuffer:p_->bField[ih] offset:0 atIndex:1];
-            [e dispatchThreads:MTLSizeMake(nn * ns, 1, 1) threadsPerThreadgroup:tg];
-
-            [e setComputePipelineState:p_->pRow];
+            // The near field has to survive, so the transform is written
+            // elsewhere: the row pass reads the field and writes bSrc, which is
+            // only live inside fieldStep and so is free to borrow here. Copying
+            // the slice first and transforming in place would cost a read and a
+            // write of every point for nothing.
+            [e setComputePipelineState:p_->pRowO];
             [e setBuffer:p_->bSrc offset:0 atIndex:0];
             [e setBuffer:p_->bW offset:0 atIndex:1];
             [e setBytes:&fwd length:4 atIndex:2];
+            [e setBuffer:p_->bField[ih] offset:0 atIndex:3];
             [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
 
             [e setComputePipelineState:p_->pCol];
