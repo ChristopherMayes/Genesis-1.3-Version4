@@ -1,29 +1,25 @@
 # TODO
 
-## 1. The three upstream pull requests
+## 1. The four upstream pull requests
 
 All are open **as drafts** against `svenreiche/Genesis-1.3-Version4`, ready for you to edit and
 then mark ready for review. Take #272 out of draft first — #273's body references it, because
-the three-FFT branch it touches is unreachable without the filter fix. #274 is independent of
-both and can go at any time.
+the three-FFT branch it touches is unreachable without the filter fix. #274 and #275 are
+independent of both and of each other, and can go at any time.
 
 | PR | branch | commit | title |
 |---|---|---|---|
 | [#272](https://github.com/svenreiche/Genesis-1.3-Version4/pull/272) | `fix/source-filter-noop` | `4fe13fe` | Fix `source_filter` being silently ignored in `FieldSolverFFT` |
 | [#273](https://github.com/svenreiche/Genesis-1.3-Version4/pull/273) | `perf/fft-two-pass` | `e101b30` | `FieldSolverFFT`: drop the source-term FFT when the source filter is off |
 | [#274](https://github.com/svenreiche/Genesis-1.3-Version4/pull/274) | `perf/user-diagnostic-guard` | `b815d7a` | Skip the user diagnostic's per-particle work when its output is disabled |
+| [#275](https://github.com/svenreiche/Genesis-1.3-Version4/pull/275) | `fix/lattice-seed-key` | `b997669` | Fix an uncaught exception when `&lattice` sets a seed |
 
 The bodies as submitted are `PR-1-source-filter-fix.md` and `PR-2-fft-two-pass.md`. Edit them on
 GitHub, not here — these files are only the record of what was sent.
 
-### Fourth report, ready to go: `&lattice` with a `seed` key aborts
-
-`AlterLattice::init` tests for the key `seed` and then reads `arg->at("iseed")`, a key that
-never exists, so any deck that sets a seed for undulator field or orbit errors dies with an
-uncaught `std::out_of_range: map::at: key not found` and no message naming the namelist. The
-fix is the one-character kind. This is entirely independent of the GPU work and of the three
-PRs above, so it should go on its own branch off `master`. Found by the GPU validation sweep,
-which could not construct a reproducible field-error case until the seed was removed.
+#275 was built and tested in a worktree at `/tmp/g4seed` (branch off `master`, own `build/`),
+which is still there if Sven asks for changes. The same fix is on `gpu/metal-engine` as
+`4ef0989`, with identical content, so the branches will merge cleanly.
 
 ### Possible fifth report: `transient` in `&wake` appears to do nothing
 
