@@ -122,10 +122,6 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
     if (!fftsolver) {
       clash = "the GPU propagates the field by FFT and has no ADI solver, so "
               "fft_fieldsolver = true is required";
-    } else if (doFilter) {
-      clash = "source_filter is not implemented on the GPU. The GPU field solve "
-              "drops one of the three transforms, which is exact only while the "
-              "source term is unfiltered";
     } else if (bunchharm > GPUEngine::maxBunchHarm()) {
       stringstream ss;
       ss << "bunchharm = " << bunchharm << ", but the GPU diagnostic reduction "

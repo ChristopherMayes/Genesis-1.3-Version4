@@ -280,6 +280,18 @@ Two lessons about the harness itself are worth keeping:
       zero and deposit passes could be one kernel, and the field solve's four passes are only
       separable because a 256x256 slice does not fit in threadgroup memory.
 
+- [x] **Port `source_filter`.** With the filter off the solve is four passes, because the
+      transform is linear and the source can be added after the back transform. With it on the
+      source is shaped in Fourier space, so it needs its own forward transform and the
+      combination has to happen there: six passes. The filter table is built at startup from
+      the same expression `FieldSolverFFT::init` uses, taken from the values the solver
+      settled on rather than the ones the deck asked for, since an unphysical width disables
+      it there. Cost on the 500-slice deck: 3.67 s to 4.31 s.
+      Filtering *improves* GPU-CPU agreement, 2.1e-04 to 1.5e-05 in the field, because it
+      removes the high spatial frequencies where FP32 is weakest — the same effect as raising
+      `npart` at large `ngrid`, seen from the other side. The strong case is the one worth
+      keeping in the sweep: it changes `Field/xsize` by 25% while the paths differ by 1.5e-05.
+
 ### Constraints that must not be forgotten
 
 - Apple GPUs have **no FP64**. Metal has no `double`. FP32 is mandatory, not a choice.

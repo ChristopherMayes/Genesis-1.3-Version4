@@ -286,6 +286,18 @@ kw["extra"] = kw.get("extra", "") + \
     "&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n"
 case("time_isr", edit=e, **kw)
 
+# -- source filter ----------------------------------------------------------
+# With the filter on, the source is shaped in Fourier space and so needs its own
+# forward transform; the field solve goes from four passes to six. The strong
+# case is the one that discriminates: it changes Field/xsize by 25%, where the
+# two paths differ by 1e-05. It also agrees better than an unfiltered deck does,
+# because the filter removes the high spatial frequencies where single precision
+# is weakest.
+case("source_filter", edit={"track.source_filter": True, "track.xcut": 0.8,
+                            "track.ycut": 0.8, "track.sigmoid": 0.1})
+case("source_filter_strong", edit={"track.source_filter": True, "track.xcut": 0.15,
+                                   "track.ycut": 0.15, "track.sigmoid": 0.05})
+
 # -- short-range space charge -----------------------------------------------
 # The mode structure is what varies: the monopole alone, then azimuthal modes,
 # then several longitudinal ones. nphi in particular changes which mode the
@@ -318,9 +330,6 @@ case("refuse_one4one", edit=e, expect="error:one4one", **kw)
 # Options the GPU cannot honour. Left unguarded each of these would run to
 # completion and write an output file, having quietly done something other than
 # what the deck asked for, which is worse than refusing.
-case("refuse_source_filter", edit={"track.source_filter": True},
-     expect="error:source_filter",
-     note="the two-pass field solve is exact only while the filter is off")
 case("refuse_adi_solver", edit={"track.fft_fieldsolver": False},
      expect="error:fft_fieldsolver",
      note="the GPU has no ADI solver and would silently propagate by FFT")

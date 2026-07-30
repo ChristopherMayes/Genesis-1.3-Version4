@@ -236,6 +236,49 @@ kernel void fft_rows_mul(device float2* d [[buffer(0)]], const device float2* W 
     for (uint cc=0;cc<CHUNK;cc++)
         for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
 }
+// Inverse row pass which also adds the transformed source. Used only when the
+// source filter is on, where the source has been through its own forward
+// transform and so has to be combined in Fourier space rather than after the
+// back transform.
+kernel void fft_rows_mul_add(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+                             constant float& sgn [[buffer(2)]], const device float2* expK [[buffer(3)]],
+                             const device float2* sf [[buffer(4)]],
+                             uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
+    threadgroup float2 sh[RF_ROWS*NG];
+    uint lane = t % LANES, r = t / LANES;
+    ulong row = (ulong)(tg.x*RF_ROWS + r);
+    ulong off = (ulong)tg.y*((ulong)N*N) + row*N;
+    device float2* p = d + off;
+    const device float2* k = expK + row*N;
+    const device float2* s = sf + off;
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++){
+        uint j = LANES*n1 + lane;
+        a[n1] = cmul(p[j], k[j]) + 2.0f*s[j];
+    }
+    fftN(a, sh + r*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++) p[OUTK(cc,j)] = a[cc*LANES+j];
+}
+// Forward column pass which applies the source filter as it writes. The filter
+// is a real function of the transverse wavenumber and does not depend on the
+// slice, so it is indexed by position within the slice.
+kernel void fft_cols_filt(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
+                          constant float& sgn [[buffer(2)]], const device float* filt [[buffer(3)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
+    threadgroup float2 sh[CC_COLS*NG];
+    uint c = t % CC_COLS, lane = t / CC_COLS;
+    ulong col = (ulong)tg.x*CC_COLS + c;
+    device float2* b = d + (ulong)tg.y*((ulong)N*N) + col;
+    float2 a[REGS];
+    for (uint n1=0;n1<REGS;n1++) a[n1] = b[(ulong)(LANES*n1+lane)*N];
+    fftN(a, sh + c*NG, W, lane, sgn);
+    for (uint cc=0;cc<CHUNK;cc++)
+        for (uint j=0;j<LANES;j++){
+            ulong q = (ulong)OUTK(cc,j)*N;
+            b[q] = a[cc*LANES+j]*filt[col + q];
+        }
+}
 kernel void fft_cols(device float2* d [[buffer(0)]], const device float2* W [[buffer(1)]],
                      constant float& sgn [[buffer(2)]], constant float& scale [[buffer(3)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]){
@@ -997,6 +1040,12 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bSCphi {nil}, bSCidx {nil}, bEZP {nil};
     bool scOn {false};
     int scNgrid {2};
+
+    // Source filter: real, shared by every slice, applied to the transformed
+    // source term. When it is off the field solve takes the cheaper four-pass
+    // route and this buffer is a placeholder.
+    id<MTLBuffer> bFilt {nil};
+    bool filterOn {false};
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
@@ -1004,7 +1053,7 @@ struct MetalEngine::Impl {
     id<MTLBuffer> bBM {nil};
     id<MTLBuffer> bFM {nil};
 
-    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pRowO, pCol, pColA, pTrk, pPush;
+    id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pRowO, pRowMA, pCol, pColA, pColF, pTrk, pPush;
     id<MTLComputePipelineState> pBM, pFM, pELoss, pISR, pR56;
     id<MTLComputePipelineState> pSCa, pSCp, pSCs;
 
@@ -1332,6 +1381,38 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         return false;
     }
 
+    // Source filter, tabulated exactly as FieldSolverFFT::init does, from the
+    // values the solver settled on rather than the ones the deck asked for: an
+    // unphysical width or centre turns the filter off there rather than being
+    // used. The filter is real, shared by every slice, and depends only on the
+    // transverse wavenumber, so it is one array of ngrid^2 floats.
+    {
+        double xcf = 1, ycf = 1, sigf = 1;
+        p_->filterOn = field->at(0)->getSourceFilter(xcf, ycf, sigf);
+        for (size_t i = 1; i < field->size(); i++) {
+            double a, b, c;
+            if (field->at(i)->getSourceFilter(a, b, c) != p_->filterOn) {
+                reason = "the source filter is on for some field harmonics and "
+                         "off for others, which the GPU field solve cannot do";
+                return false;
+            }
+        }
+        p_->bFilt = alloc((p_->filterOn ? nn : 1) * sizeof(float));
+        if (p_->filterOn) {
+            float *fl = (float *)[p_->bFilt contents];
+            const double shift = -0.5 * (ng - 1);
+            for (int iy = 0; iy < ng; iy++) {
+                const double y = (iy + shift) / static_cast<double>(ng) / ycf;
+                for (int ix = 0; ix < ng; ix++) {
+                    const double x = (ix + shift) / static_cast<double>(ng) / xcf;
+                    const int ii = ((iy + (ng + 1) / 2) % ng) * ng + ((ix + (ng + 1) / 2) % ng);
+                    const double r = (sqrt(x * x + y * y) - 1) / sigf;
+                    fl[ii] = static_cast<float>(1.0 / (1.0 + exp(r)));
+                }
+            }
+        }
+    }
+
     std::complex<float> *W = (std::complex<float> *)[p_->bW contents];
     for (int m = 0; m < ng; m++) {
         const double a = -2.0 * M_PI * m / ng;
@@ -1376,6 +1457,8 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pRow = pso(@"fft_rows");
     p_->pRowM = pso(@"fft_rows_mul");
     p_->pRowO = pso(@"fft_rows_out");
+    p_->pRowMA = pso(@"fft_rows_mul_add");
+    p_->pColF = pso(@"fft_cols_filt");
     p_->pCol = pso(@"fft_cols");
     p_->pColA = pso(@"fft_cols_add");
     p_->pTrk = pso(@"track_beam");
@@ -1478,12 +1561,12 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
                      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
 
-            // field = IFFT(FFT(field)*expK)/ngrid^2 + 2*src, four passes.
             const MTLSize rowTG = MTLSizeMake(ng / p_->rowsPerTG, ns, 1);
             const MTLSize rowT = MTLSizeMake(p_->rowsPerTG * p_->lanes, 1, 1);
             const MTLSize colTG = MTLSizeMake(ng / p_->colsPerTG, ns, 1);
             const MTLSize colT = MTLSizeMake(p_->colsPerTG * p_->lanes, 1, 1);
 
+            // The field's own forward transform, which both paths need.
             [e setComputePipelineState:p_->pRow];
             [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
             [e setBuffer:p_->bW offset:0 atIndex:1];
@@ -1497,20 +1580,60 @@ void MetalEngine::fieldStep(Undulator *und, std::vector<Field *> *field,
             [e setBytes:&one length:4 atIndex:3];
             [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
 
-            [e setComputePipelineState:p_->pRowM];
-            [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
-            [e setBuffer:p_->bW offset:0 atIndex:1];
-            [e setBytes:&inv length:4 atIndex:2];
-            [e setBuffer:p_->bExpK[ih] offset:0 atIndex:3];
-            [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
+            if (p_->filterOn) {
+                // Filtered: the source is shaped in Fourier space, so it needs
+                // its own forward transform and has to be combined there. Six
+                // passes rather than four.
+                //
+                //   field = IFFT(FFT(field)*expK + 2*filter*FFT(src))/ngrid^2
+                [e setComputePipelineState:p_->pRow];
+                [e setBuffer:p_->bSrc offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&fwd length:4 atIndex:2];
+                [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
 
-            [e setComputePipelineState:p_->pColA];
-            [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
-            [e setBuffer:p_->bW offset:0 atIndex:1];
-            [e setBytes:&inv length:4 atIndex:2];
-            [e setBytes:&nrm length:4 atIndex:3];
-            [e setBuffer:p_->bSrc offset:0 atIndex:4];
-            [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
+                [e setComputePipelineState:p_->pColF];
+                [e setBuffer:p_->bSrc offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&fwd length:4 atIndex:2];
+                [e setBuffer:p_->bFilt offset:0 atIndex:3];
+                [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
+
+                [e setComputePipelineState:p_->pRowMA];
+                [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&inv length:4 atIndex:2];
+                [e setBuffer:p_->bExpK[ih] offset:0 atIndex:3];
+                [e setBuffer:p_->bSrc offset:0 atIndex:4];
+                [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
+
+                [e setComputePipelineState:p_->pCol];
+                [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&inv length:4 atIndex:2];
+                [e setBytes:&nrm length:4 atIndex:3];
+                [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
+            } else {
+                // Unfiltered: the source is untouched in Fourier space, and the
+                // transform is linear, so it can simply be added after the back
+                // transform. Four passes.
+                //
+                //   field = IFFT(FFT(field)*expK)/ngrid^2 + 2*src
+                [e setComputePipelineState:p_->pRowM];
+                [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&inv length:4 atIndex:2];
+                [e setBuffer:p_->bExpK[ih] offset:0 atIndex:3];
+                [e dispatchThreadgroups:rowTG threadsPerThreadgroup:rowT];
+
+                [e setComputePipelineState:p_->pColA];
+                [e setBuffer:p_->bField[ih] offset:0 atIndex:0];
+                [e setBuffer:p_->bW offset:0 atIndex:1];
+                [e setBytes:&inv length:4 atIndex:2];
+                [e setBytes:&nrm length:4 atIndex:3];
+                [e setBuffer:p_->bSrc offset:0 atIndex:4];
+                [e dispatchThreadgroups:colTG threadsPerThreadgroup:colT];
+            }
         }
     }
     p_->syncIfFull();
