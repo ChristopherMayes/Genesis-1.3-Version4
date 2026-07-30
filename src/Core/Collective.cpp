@@ -135,7 +135,6 @@ void Collective::apply(Beam *beam, Undulator *und, double delz)
   // apply wakes
 
   for (int ic = 0; ic <beam->current.size(); ic++){
-    beam->eloss[ic]=wakeext.at(ic)+wakeint.at(ic);
     double dg=beam->eloss[ic]*delz/eev;    // actual beam loss per integration step
     unsigned long npart=beam->beam.at(ic).size();
     for (unsigned long ip=0; ip<npart; ip++){

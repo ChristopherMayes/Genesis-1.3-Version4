@@ -1369,7 +1369,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         float *ez = (float *)[p_->bEZ contents];
         for (int is = 0; is < ns; is++) {
             ez[is] = (is < static_cast<int>(beam->longESC.size()))
-                         ? static_cast<float>(-beam->longESC[is] / 511000.0)
+                         ? static_cast<float>(-beam->longESC[is] / eev)
                          : 0.0f;
         }
 
@@ -1383,7 +1383,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
             float *el = (float *)[p_->bELoss contents];
             for (int is = 0; is < ns; is++) {
                 el[is] = (is < static_cast<int>(beam->eloss.size()))
-                             ? static_cast<float>(beam->eloss[is] * delz / 511000.0)
+                             ? static_cast<float>(beam->eloss[is] * delz / eev)
                              : 0.0f;
             }
         }
