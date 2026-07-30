@@ -31,6 +31,10 @@ public:
     double getSCField(int);
     void checkAllocation(unsigned long i);
     [[nodiscard]] bool hasShortRangeSC() const { return efield.hasShortRange(); }
+    bool planShortRangeSC(const std::vector<double> &rbound, double gz2, SCPlan &plan)
+        { return efield.planShortRange(rbound, gz2, plan); }
+    void setSCFieldOut(int islice, double v) { efield.setSCField(islice, v); }
+    [[nodiscard]] int scGridSize() const { return efield.scGridSize(); }
 
 private:
     complex<double> cpart;

@@ -195,7 +195,30 @@ Two lessons about the harness itself are worth keeping:
       draws at about 15 ns each. `doLoss` alone skips the draws entirely, because the spread
       scales them by zero, and costs 4.96 s. For scale, the radiation itself changes
       `Field/power` by 25% and `Beam/energyspread` by 8.9%.
-- [ ] Port short-range space charge (hard error today)
+- [x] **Port short-range space charge.** The solve is a set of azimuthal and longitudinal
+      modes; per mode pair the particles of a slice are binned in radius into a complex
+      source, a tridiagonal system is solved on the radial grid, and the answer is gathered
+      back. One threadgroup per slice, radial arrays in threadgroup memory, and the
+      recurrence run by a single thread while the others wait.
+      **`rmax` is the part that cannot live on the device.** It grows to hold the widest
+      slice seen so far, sequentially over slices and persistently over the run, so a slice
+      is solved on a grid that already accounts for the ones before it. An analysis kernel
+      reduces each slice to a centroid and a radius, the host replays the growth exactly as
+      `analyseBeam` does, and the spacing comes back per slice: one round trip per step and
+      three floats per slice instead of the particles.
+      The radial grid is capped at 384 points by the 32 KB of threadgroup memory, at about
+      72 bytes per point; above that the deck is refused by name. The default is 100.
+      **Do not validate this against `Beam/SSCfield` early in a run.** It is the `l = 1`
+      mode, and before the beam bunches the source term is thousands of unit phasors
+      cancelling to nothing: 1e-18 in FP64 against 1e-10 in FP32, a ratio of 1e8 between two
+      numbers that are both zero. That looked like a 14% error for a while. Compared on the
+      same bunched particles the two fields agree to 4.0e-07 of peak, correlation
+      1.000000000. `SSCfield` also reports whichever `m` came last, so with `nphi > 0` it is
+      a dipole and averages to noise for a round beam.
+      Two scalars have to be taken the way `BeamSolver::advance` takes them and not from the
+      nearest similar-looking variable: `gammaz2` uses the lattice `aw`, not the one
+      `TrackBeam` zeroes outside an undulator, and the wavenumber is the reference one from
+      `&setup`.
 - [x] **Port the corrector kick.** `MetalEngine::beamStep` used to refuse any step with a
       non-zero `cx` or `cy`, and `orbiterror = true` is implemented as a per-step corrector,
       so a deck with undulator orbit errors put 187 of 196 steps back on the CPU and got

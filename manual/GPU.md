@@ -113,8 +113,9 @@ timings under a GPU label. The messages are explicit about the reason:
 *** Error: gpu = true in &track, but ngrid = 151 is not supported by the Metal
     field solver, which handles powers of two from 64 to 1024. Set ngrid = 128
     in &field. ...
-*** Error: gpu = true in &track, but short-range space charge (nz/nphi in
-    &efield) is not implemented on the GPU yet
+*** Error: gpu = true in &track, but ngrid = 512 in &efield, but the GPU
+    space-charge solve holds the radial arrays in threadgroup memory and
+    handles 3 to 384
 ```
 
 ## What is supported
@@ -134,7 +135,7 @@ the longitudinal push and all of the per-slice diagnostics. Around that:
 | chicanes | supported; the transfer map rides on the opening half step and the R56 shear sits before the closing one |
 | wakefields (`&wake`) | supported, including the resistive wall |
 | incoherent radiation (`&sponrad`) | supported; both the loss and the spread, reproducing the CPU run rather than only its statistics |
-| short-range space charge | hard error |
+| space charge (`&efield`) | supported, long and short range; the radial grid runs to 384 points |
 
 Everything in that table that is not supported is a hard error rather than a
 fallback. The reason is the same in each case: the alternative is a run that
@@ -269,6 +270,43 @@ For scale, on the steady-state deck the radiation changes `Field/power` by 25%,
 `Beam/energyspread` by 8.9% and `Beam/bunching` by 9.5%. Against that, the two
 processors differ by 2.2e-04 in the field and 3.2e-06 in the beam.
 
+### Space charge
+
+An `&efield` block works on the GPU, both the long-range field, which was
+already there, and the short-range solve that `nz` and `nphi` switch on.
+
+The short-range solve is a set of azimuthal modes `m` and longitudinal modes
+`l`. For each pair the particles of a slice are binned in radius into a complex
+source term, a tridiagonal system is solved on the radial grid, and the result
+is gathered back onto the particles. That is one threadgroup per slice, with the
+radial arrays in threadgroup memory. The tridiagonal solve is a recurrence, so
+one thread runs it while the others wait; the grid is small enough that the
+alternatives cost more than they save.
+
+One part cannot stay on the device. `rmax` grows to hold the widest slice seen
+so far, and it does so as the slices are visited in order and persists across
+the whole run, so slice *k* is solved on a grid that already accounts for the
+slices before it. A backend that sized each slice independently would agree with
+the CPU only until the first slice wider than the grid. The analysis pass
+therefore reduces each slice to a centroid and a bounding radius, the host
+replays that growth exactly as `analyseBeam` does — including the message when
+the grid is enlarged — and the resulting spacing comes back per slice. It costs
+one round trip per step and three floats per slice, rather than the particles.
+
+The radial grid is limited to 384 points, because the six complex and four real
+arrays of the solve come to about 72 bytes per point and a threadgroup has 32 KB.
+Above that the deck is refused by name. The default is 100.
+
+**Do not judge this solve by `Beam/SSCfield` at the start of a run.** That output
+is the `l = 1` mode, and at the head of a run there is no bunching, so the source
+term is a sum of thousands of unit phasors that should cancel to nothing. What
+survives is the arithmetic: 1e-18 in the CPU's double precision and 1e-10 in the
+GPU's single, a ratio of 1e8 between two numbers that are both zero. Compared
+where the field is real, on the same bunched particles, the two agree to 4.0e-07
+of peak with a correlation of 1.000000000. Note also that `SSCfield` reports
+whichever azimuthal mode came last, since the CPU writes it once per `m`, so with
+`nphi > 0` it is a dipole or higher and averages to noise for a round beam.
+
 ## The worked example
 
 Everything below is in `examples/metal-gpu/` and takes a few minutes.
@@ -347,10 +385,10 @@ conda install -n genesis4-dev -c conda-forge h5py numpy
 
 ### 3. The full validation matrix
 
-`sweep.py` runs sixty-five decks against the CPU path on the same inputs and
-prints one line per case. Fifty-five of them compare per-step differences
+`sweep.py` runs seventy-one decks against the CPU path on the same inputs and
+prints one line per case. Sixty of them compare per-step differences
 under `gpu_validate`, eight of those being decks the backend must refuse; the
-remaining ten run to completion and compare the output against a bound derived
+remaining eleven run to completion and compare the output against a bound derived
 from the per-step figure times the step count. A case that falls back to the CPU
 where it should not is a failure, because a fallback gives the right answer by
 the slow route and is exactly how an unported element would hide.

@@ -173,6 +173,29 @@ void EFieldSolver::analyseBeam(vector<Particle> *beam){
     }
 }
 
+bool EFieldSolver::planShortRange(const std::vector<double> &rbound, double gz2, SCPlan &plan)
+{
+    if (!this->hasShortRange()) { return false; }
+
+    plan.nz = nz;
+    plan.nphi = nphi;
+    plan.ngrid = ngrid;
+    plan.coef = -gz2/ks/ks;
+    plan.dr.assign(rbound.size(), 0.0);
+
+    // The same growth analyseBeam() performs, in the same order, including the
+    // message, so that a run driven this way reports what a host-side run does.
+    for (size_t is = 0; is < rbound.size(); is++) {
+        if (rbound[is] > rmax) {
+            rmax = rbound[is]*1.5;
+            cout << "*** Info (Rank "<< rank << "): Adjusting radial grid size for space charge calculation" << endl;
+            cout << "    New grid size: " << rmax <<  " to hold all electrons" << endl;
+        }
+        plan.dr[is] = rmax/static_cast<double>(ngrid-1);
+    }
+    return true;
+}
+
 void EFieldSolver::constructLaplaceOperator(){
 
     // r_j are the center grid points. The boundaries are given +/-dr/2. Thus r_j=(j+1/2)*dr

@@ -130,11 +130,26 @@ bool Beam::computeIncoherentKick(Undulator *und, double delz, vector<double> &dg
 }
 
 
+// Short-range space charge, for a backend holding the particles elsewhere. The
+// caller supplies the largest particle radius of each slice, which is the only
+// thing the host needs from the particles, and gets back the parameters of the
+// solve. See EFieldSolver::planShortRange for why the radial grid has to be
+// advanced over the slices in order.
+bool Beam::planShortRangeSC(const vector<double> &rbound, double gz2, SCPlan &plan)
+{
+  return solver.planShortRangeSC(rbound, gz2, plan);
+}
+
+void Beam::setSCField(int islice, double v)
+{
+  solver.setSCFieldOut(islice, v);
+}
+
+
 // Reports any effect that Beam::track applies but the GPU backend does not yet
 // implement. Used to refuse GPU tracking rather than silently dropping physics.
 bool Beam::gpuUnsupportedPhysics(string &what) const
 {
-  if (solver.hasShortRangeSC()){ what = "short-range space charge (nz/nphi in &efield)"; return true; }
   return false;
 }
 

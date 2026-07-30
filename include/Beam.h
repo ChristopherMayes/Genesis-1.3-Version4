@@ -40,6 +40,10 @@ class Beam{
    bool hasWake();
    bool computeWakeLoss(Undulator *und);
    bool computeIncoherentKick(Undulator *und, double delz, vector<double> &dg);
+   bool planShortRangeSC(const vector<double> &rbound, double gz2, SCPlan &plan);
+   void setSCField(int islice, double v);
+   bool hasShortRangeSC() const { return solver.hasShortRangeSC(); }
+   int  scGridSize() const { return solver.scGridSize(); }
    bool gpuUnsupportedPhysics(string &what) const;
    double getSCField(int);
    void setBunchingHarmonicOutput(int harm_in);

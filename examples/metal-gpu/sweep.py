@@ -286,10 +286,23 @@ kw["extra"] = kw.get("extra", "") + \
     "&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n"
 case("time_isr", edit=e, **kw)
 
+# -- short-range space charge -----------------------------------------------
+# The mode structure is what varies: the monopole alone, then azimuthal modes,
+# then several longitudinal ones. nphi in particular changes which mode the
+# SSCfield diagnostic reports, since the CPU writes it once per m and the last
+# one wins.
+case("sc_monopole", extra="&efield\nnz = 1\nnphi = 0\nngrid = 32\n&end\n")
+case("sc_azimuthal", extra="&efield\nnz = 1\nnphi = 2\nngrid = 32\n&end\n")
+case("sc_modes", extra="&efield\nnz = 4\nnphi = 1\nngrid = 32\n&end\n")
+case("sc_grid_128", extra="&efield\nnz = 1\nnphi = 0\nngrid = 128\n&end\n")
+case("sc_longrange",
+     extra="&efield\nnz = 1\nnphi = 0\nngrid = 32\nlongrange = true\n&end\n")
+
 # -- physics the GPU does not implement, which must be refused --------------
-case("refuse_spacecharge_short",
-     extra="&efield\nnz = 2\nnphi = 2\nngrid = 32\n&end\n",
-     expect="error:short-range space charge")
+case("refuse_spacecharge_grid",
+     extra="&efield\nnz = 1\nnphi = 0\nngrid = 512\n&end\n",
+     expect="error:threadgroup memory",
+     note="the radial arrays of the solve have to fit in threadgroup memory")
 case("refuse_ngrid_odd", edit={"field.ngrid": 151},
      expect="error:Set ngrid = 128")
 case("refuse_ngrid_2048", edit={"field.ngrid": 2048},
@@ -344,6 +357,12 @@ case("run_corrector", tier="run", lat=LAT_CORRECTOR)
 # had drifted by a step. A full run on each device is what checks it.
 case("run_isr", tier="run",
      extra="&sponrad\nseed = 1234\ndoLoss = true\ndoSpread = true\n&end\n")
+# The space charge grows its radial grid to hold the widest slice seen so far,
+# and that growth is sequential over slices and persistent over the run. The
+# step tier cannot see it drift, because it re-uploads the host state every
+# step and the host is where the growth is replayed.
+case("run_spacecharge", tier="run",
+     extra="&efield\nnz = 2\nnphi = 1\nngrid = 32\n&end\n")
 
 
 # --------------------------------------------------------------------------

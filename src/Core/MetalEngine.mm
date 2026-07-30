@@ -55,6 +55,25 @@ using namespace metal;
 constant uint N = NG;
 
 inline float2 cmul(float2 a, float2 b){ return float2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
+inline float2 cdiv(float2 a, float2 b){
+    float d = b.x*b.x + b.y*b.y;
+    return float2((a.x*b.x + a.y*b.y)/d, (a.y*b.x - a.x*b.y)/d);
+}
+
+// Metal has atomic_float in the device address space only, so a threadgroup
+// float accumulation is a compare and swap on the bit pattern. Cheap in local
+// memory, and the alternative -- one device atomic per particle per mode -- is
+// not.
+inline void tg_add(threadgroup float* p, float v){
+    threadgroup atomic_uint* a = (threadgroup atomic_uint*)p;
+    uint old = atomic_load_explicit(a, memory_order_relaxed);
+    uint want;
+    do {
+        want = as_type<uint>(as_type<float>(old) + v);
+    } while (!atomic_compare_exchange_weak_explicit(a, &old, want,
+                                                    memory_order_relaxed,
+                                                    memory_order_relaxed));
+}
 
 // Twiddle stride: the table holds W_N, so W_P^m lives at index (NG/P)*m.
 #define WSTRIDE(P) ((uint)(NG)/(uint)(P))
@@ -559,6 +578,7 @@ struct PushPar {
     float ax, ay, kx, ky, gradx, grady;
     float gridmax, dgrid;
     uint  ngrid, npart, nslice, nfld;
+    uint  useSR;           // 1 if a per-particle space-charge field is supplied
     float rtmp[MAXH];      // und->fc(harm) / field->xks
     float rharm[MAXH];
     uint  first[MAXH];
@@ -607,6 +627,7 @@ kernel void push_beam(device float* G  [[buffer(0)]], device float* TH [[buffer(
                       const device float2* F1 [[buffer(9)]],
                       const device float2* F2 [[buffer(10)]],
                       const device float2* F3 [[buffer(11)]],
+                      const device float* EZP [[buffer(12)]],
                       uint gid [[thread_position_in_grid]]){
     uint is = gid / P.npart;
 
@@ -614,7 +635,9 @@ kernel void push_beam(device float* G  [[buffer(0)]], device float* TH [[buffer(
     float dx = x - P.ax, dy = y - P.ay;
     float awloc = 1.0f + 0.5f*(P.kx*dx*dx + P.ky*dy*dy) + P.gradx*dx + P.grady*dy;
     float btpar = 1.0f + px*px + py*py + P.aw*P.aw*awloc*awloc;
-    float ez = EZ[is];
+    // The long-range field is one number per slice; the short-range solve adds
+    // one per particle, as BeamSolver::advance sums them.
+    float ez = EZ[is] + ((P.useSR != 0u) ? EZP[gid] : 0.0f);
 
     // Bilinear gather of each harmonic at the particle position.
     float2 rpart[MAXH];
@@ -677,6 +700,181 @@ kernel void apply_eloss(device float* G [[buffer(0)]],
     G[gid] += DG[gid/npart];
 }
 
+// ---------------- short-range space charge ----------------
+//
+// EFieldSolver::shortRange, one threadgroup per slice. The solve is a set of
+// azimuthal modes m and longitudinal modes l; for each pair the particles are
+// binned in radius into a complex source term, a tridiagonal system is solved
+// on the radial grid, and the result is gathered back onto the particles.
+//
+// Two things are host side. The radial grid spacing arrives per slice, because
+// rmax grows over the slices in order and a slice must be solved on a grid that
+// already holds the widest slice before it. The centroid and the largest radius
+// come from sc_analyse below, whose only purpose is to give the host that
+// growth without sending it the particles.
+
+kernel void sc_analyse(const device float* X [[buffer(0)]],
+                       const device float* Y [[buffer(1)]],
+                       device float* out     [[buffer(2)]],
+                       constant uint& npart  [[buffer(3)]],
+                       uint slice [[threadgroup_position_in_grid]],
+                       uint t     [[thread_index_in_threadgroup]],
+                       uint nt    [[threads_per_threadgroup]]){
+    threadgroup float sh[NSIMD];
+    const ulong o = (ulong)slice * npart;
+
+    float sx = 0, sy = 0;
+    for (uint i=t; i<npart; i+=nt){ sx += X[o+i]; sy += Y[o+i]; }
+    sx = tg_sum(sx, sh, t); sy = tg_sum(sy, sh, t);
+    const float xc = sx/float(npart), yc = sy/float(npart);
+
+    float r2 = 0;
+    for (uint i=t; i<npart; i+=nt){
+        float dx = X[o+i]-xc, dy = Y[o+i]-yc;
+        r2 = max(r2, dx*dx+dy*dy);
+    }
+    r2 = tg_max(r2, sh, t);
+
+    if (t == 0){
+        out[3*slice+0] = xc;
+        out[3*slice+1] = yc;
+        out[3*slice+2] = sqrt(r2);
+    }
+}
+
+struct SCPar {
+    float coef, econstScale, dummy0, dummy1;
+    uint  npart, ngrid, nz, nphi;
+};
+
+// Radius bin and azimuth of every particle, against the centroid and spacing of
+// its own slice. Held for the whole solve so that the atan2 is paid once rather
+// than once per mode pair.
+kernel void sc_prepare(const device float* X   [[buffer(0)]],
+                       const device float* Y   [[buffer(1)]],
+                       const device float* CEN [[buffer(2)]],
+                       const device float* DR  [[buffer(3)]],
+                       device float* PHI       [[buffer(4)]],
+                       device uint* IDX        [[buffer(5)]],
+                       constant uint2& P       [[buffer(6)]],
+                       uint gid [[thread_position_in_grid]]){
+    uint npart = P.x, ng = P.y;
+    uint is = gid/npart;
+    float dx = X[gid] - CEN[3*is+0];
+    float dy = Y[gid] - CEN[3*is+1];
+    PHI[gid] = atan2(dy, dx);
+    // The grid is sized to hold the widest particle, so this cannot exceed the
+    // last bin except by rounding at the very edge. The clamp is here because
+    // the consequence on the device is a write outside threadgroup memory
+    // rather than a wrong number.
+    IDX[gid] = min(uint(floor(sqrt(dx*dx+dy*dy)/DR[is])), ng-1u);
+}
+
+// The mode solve. One threadgroup per slice; the radial arrays live in
+// threadgroup memory, so the grid is limited by what fits there.
+kernel void sc_solve(const device float* TH  [[buffer(0)]],
+                     const device float* PHI [[buffer(1)]],
+                     const device uint* IDX  [[buffer(2)]],
+                     const device float* DR  [[buffer(3)]],
+                     const device float* CUR [[buffer(4)]],
+                     device float* EZ        [[buffer(5)]],
+                     device float* SCOUT     [[buffer(6)]],
+                     constant SCPar& P       [[buffer(7)]],
+                     uint slice [[threadgroup_position_in_grid]],
+                     uint t     [[thread_index_in_threadgroup]],
+                     uint nt    [[threads_per_threadgroup]]){
+    threadgroup float2 csrc[SC_NGRID];
+    threadgroup float2 clow[SC_NGRID], cmid[SC_NGRID], cupp[SC_NGRID];
+    threadgroup float2 celm[SC_NGRID], cgam[SC_NGRID];
+    threadgroup float  vol[SC_NGRID], rlog[SC_NGRID], ldig[SC_NGRID+1], lmid[SC_NGRID];
+    // Accumulated separately from csrc because the address of a vector element
+    // cannot be taken, and the atomic accumulation below needs a float*.
+    threadgroup float  srcR[SC_NGRID], srcI[SC_NGRID];
+    threadgroup float  sh[NSIMD];
+
+    const uint ng = P.ngrid, np = P.npart;
+    const ulong o = (ulong)slice * np;
+    const float pi = 3.14159265358979323846f;
+    const float dr = DR[slice];
+
+    // constructLaplaceOperator, once per slice
+    for (uint j=t; j<ng; j+=nt){
+        vol[j]  = (j == 0) ? pi*dr*dr : pi*dr*dr*float(2*j+1);
+        ldig[j] = (j == 0) ? 0.0f : 2.0f*pi*float(j);
+        rlog[j] = (j == 0) ? 0.5f : log(float(j+1)/float(j));
+    }
+    if (t == 0){ ldig[ng] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float econst = P.econstScale * CUR[slice] / float(np);
+
+    for (uint i=t; i<np; i+=nt){ EZ[o+i] = 0.0f; }
+
+    for (int m = -int(P.nphi); m <= int(P.nphi); m++){
+        for (uint j=t; j<ng; j+=nt){
+            lmid[j] = -ldig[j] - ldig[j+1] - 2.0f*pi*float(m*m)*rlog[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t == 0){ lmid[ng-1] -= 2.0f*pi*float(ng); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint l = 1; l <= P.nz; l++){
+            for (uint j=t; j<ng; j+=nt){ srcR[j] = 0.0f; srcI[j] = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // source term: sum of exp(-i(m*phi + l*theta)) over the particles
+            // of each radial bin. Metal has no threadgroup atomic_float, so the
+            // accumulation goes through a compare and swap on the bit pattern.
+            for (uint i=t; i<np; i+=nt){
+                float a = -(float(m)*PHI[o+i] + float(l)*TH[o+i]);
+                tg_add(&srcR[IDX[o+i]], cos(a));
+                tg_add(&srcI[IDX[o+i]], sin(a));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint j=t; j<ng; j+=nt){
+                float s = econst/float(l)/vol[j];
+                csrc[j] = float2(-srcI[j]*s, srcR[j]*s);   // multiply by i*s
+                float f = P.coef/float(l*l)/vol[j];
+                clow[j] = float2(f*ldig[j], 0.0f);
+                cmid[j] = float2(1.0f + f*lmid[j], 0.0f);
+                cupp[j] = float2(f*ldig[j+1], 0.0f);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Thomas algorithm. A recurrence of ng steps, so one thread runs it
+            // while the rest wait; ng is small and the alternative costs more
+            // than it saves.
+            if (t == 0){
+                float2 bet = cmid[0];
+                celm[0] = cdiv(csrc[0], bet);
+                for (uint j=1; j<ng; j++){
+                    cgam[j] = cdiv(cupp[j-1], bet);
+                    bet = cmid[j] - cmul(clow[j], cgam[j]);
+                    celm[j] = cdiv(csrc[j] - cmul(clow[j], celm[j-1]), bet);
+                }
+                for (int j=int(ng)-2; j>-1; j--){
+                    celm[j] = celm[j] - cmul(cgam[j+1], celm[j+1]);
+                }
+                // The CPU writes this for every m at l == 1, so what survives is
+                // the last one. Matching that matters: it is the SSCfield
+                // diagnostic.
+                if (l == 1 && m == int(P.nphi)){
+                    SCOUT[slice] = length(celm[0]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint i=t; i<np; i+=nt){
+                float a = float(m)*PHI[o+i] + float(l)*TH[o+i];
+                float2 c = float2(cos(a), sin(a));
+                EZ[o+i] += 2.0f*(c.x*celm[IDX[o+i]].x - c.y*celm[IDX[o+i]].y);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 // Incoherent synchrotron radiation: the mean energy loss and, if the spread is
 // enabled, a random kick. Both are one number per beamlet rather than per
 // particle, because Incoherent::apply draws once every nbins particles and
@@ -731,6 +929,7 @@ struct PushPar {
     float ax, ay, kx, ky, gradx, grady;
     float gridmax, dgrid;
     uint32_t ngrid, npart, nslice, nfld;
+    uint32_t useSR;
     float rtmp[kMaxHarm];
     float rharm[kMaxHarm];
     uint32_t first[kMaxHarm];
@@ -738,6 +937,9 @@ struct PushPar {
 };
 
 enum { kMaxBunchHarm = 8, kBeamStride = 32, kFieldStride = 16 };
+
+// Radial grid points the space-charge solve can hold in threadgroup memory.
+enum { kMaxSCGrid = 384 };
 
 struct BMPar {
     float gref;
@@ -747,6 +949,11 @@ struct BMPar {
 struct FMPar {
     uint32_t ngrid, isfar;
     float shift, wscale;
+};
+
+struct SCPar {
+    float coef, econstScale, dummy0, dummy1;
+    uint32_t npart, ngrid, nz, nphi;
 };
 
 struct MetalEngine::Impl {
@@ -783,6 +990,13 @@ struct MetalEngine::Impl {
 
     // Beamlet size and count, for the incoherent radiation kick.
     int nbins {1}, nbeamlet {0};
+
+    // Short-range space charge: the per-slice analysis, the per-particle
+    // azimuth and radial bin it produces, and the field it leaves behind.
+    id<MTLBuffer> bSCcen {nil}, bSCdr {nil}, bSCout {nil};
+    id<MTLBuffer> bSCphi {nil}, bSCidx {nil}, bEZP {nil};
+    bool scOn {false};
+    int scNgrid {2};
     std::vector<id<MTLBuffer> > bExpK;
     std::vector<double> delzCached;
 
@@ -792,6 +1006,7 @@ struct MetalEngine::Impl {
 
     id<MTLComputePipelineState> pZero, pDep, pRow, pRowM, pRowO, pCol, pColA, pTrk, pPush;
     id<MTLComputePipelineState> pBM, pFM, pELoss, pISR, pR56;
+    id<MTLComputePipelineState> pSCa, pSCp, pSCs;
 
     size_t bytes {0};
 
@@ -1063,6 +1278,30 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         return false;
     }
 
+    // Short-range space charge. The radial arrays of the solve live in
+    // threadgroup memory, about 64 bytes per grid point across the six complex
+    // and four real arrays, so the grid is bounded by the 32 KB a threadgroup
+    // has. Everything else about the solve scales with the particles.
+    p_->scOn = beam->hasShortRangeSC();
+    p_->scNgrid = p_->scOn ? beam->scGridSize() : 2;
+    if (p_->scOn && (p_->scNgrid < 3 || p_->scNgrid > kMaxSCGrid)) {
+        std::ostringstream os;
+        os << "ngrid = " << p_->scNgrid << " in &efield, but the GPU space-charge "
+              "solve holds the radial arrays in threadgroup memory and handles 3 to "
+           << kMaxSCGrid;
+        reason = os.str();
+        return false;
+    }
+    {
+        const size_t nsc = p_->scOn ? np : 1;
+        p_->bSCcen = alloc(static_cast<size_t>(p_->nslice) * 3 * sizeof(float));
+        p_->bSCdr = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
+        p_->bSCout = alloc(static_cast<size_t>(p_->nslice) * sizeof(float));
+        p_->bSCphi = alloc(nsc * sizeof(float));
+        p_->bSCidx = alloc(nsc * sizeof(uint32_t));
+        p_->bEZP = alloc(nsc * sizeof(float));
+    }
+
     // Field solve scratch. One source buffer is enough because the harmonics
     // are propagated one after another.
     const int ng = p_->ngrid[0];
@@ -1112,6 +1351,7 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
         @"CHUNK"   : @(p_->regs / p_->lanes),
         @"RF_ROWS" : @(p_->rowsPerTG),
         @"CC_COLS" : @(p_->colsPerTG),
+        @"SC_NGRID": @(p_->scNgrid),
     };
     id<MTLLibrary> lib = [p_->dev newLibraryWithSource:kMSL options:copt error:&err];
     if (lib == nil) {
@@ -1144,6 +1384,9 @@ bool MetalEngine::init(Beam *beam, std::vector<Field *> *field, std::string &rea
     p_->pFM = pso(@"field_moments");
     p_->pELoss = pso(@"apply_eloss");
     p_->pISR = pso(@"apply_isr");
+    p_->pSCa = pso(@"sc_analyse");
+    p_->pSCp = pso(@"sc_prepare");
+    p_->pSCs = pso(@"sc_solve");
     p_->pR56 = pso(@"apply_r56");
     if (!ok) {
         reason = "compute pipeline creation failed";
@@ -1453,6 +1696,87 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
 
         encTrack(0, 0, true);   // first half step, carrying any chicane
 
+        // Short-range space charge, which BeamSolver::advance computes slice by
+        // slice just before the push and which therefore has to see the
+        // particles as the opening half step left them.
+        //
+        // The one part that cannot stay on the device is the radial grid. rmax
+        // grows to hold the widest slice seen so far, sequentially over the
+        // slices and persistently over the run, so slice k is solved on a grid
+        // that already accounts for the slices before it. The analysis kernel
+        // therefore reduces each slice to a centroid and a radius, the host
+        // replays that growth, and the resulting spacing comes back. It costs
+        // one round trip per step and three floats per slice, rather than the
+        // particles.
+        uint32_t useSR = 0;
+        if (p_->scOn) {
+            const uint32_t np32 = static_cast<uint32_t>(p_->npart);
+            [e setComputePipelineState:p_->pSCa];
+            [e setBuffer:p_->bX offset:0 atIndex:0];
+            [e setBuffer:p_->bY offset:0 atIndex:1];
+            [e setBuffer:p_->bSCcen offset:0 atIndex:2];
+            [e setBytes:&np32 length:sizeof(np32) atIndex:3];
+            [e dispatchThreadgroups:MTLSizeMake(ns, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            p_->sync();
+
+            const float *cen = (const float *)[p_->bSCcen contents];
+            std::vector<double> rbound(ns);
+            for (int is = 0; is < ns; is++) { rbound[is] = cen[3 * is + 2]; }
+
+            // Both scalars are taken the way BeamSolver::advance takes them.
+            // gammaz2 uses the lattice aw, not the one TrackBeam zeroes outside
+            // an undulator, and the wavenumber is the reference one from
+            // &setup, which is what EFieldSolver::init was given.
+            SCPlan plan;
+            const double awlat = und->getaw();
+            const double gz2 = gamma0 * gamma0 / (1 + awlat * awlat);
+            if (beam->planShortRangeSC(rbound, gz2, plan)) {
+                float *dr = (float *)[p_->bSCdr contents];
+                for (int is = 0; is < ns; is++) {
+                    dr[is] = static_cast<float>(plan.dr[is]);
+                }
+
+                SCPar S;
+                S.coef = static_cast<float>(plan.coef);
+                // vacimp/eev/ks, the rest of econst being per slice. ks is the
+                // reference wavenumber, as EFieldSolver::init formed it.
+                const double ksref = 4.0 * asin(1.0) / beam->reflength;
+                S.econstScale = static_cast<float>(vacimp / eev / ksref);
+                S.dummy0 = 0; S.dummy1 = 0;
+                S.npart = np32;
+                S.ngrid = static_cast<uint32_t>(plan.ngrid);
+                S.nz = static_cast<uint32_t>(plan.nz);
+                S.nphi = static_cast<uint32_t>(plan.nphi);
+
+                e = p_->encoder();
+                [e setComputePipelineState:p_->pSCp];
+                [e setBuffer:p_->bX offset:0 atIndex:0];
+                [e setBuffer:p_->bY offset:0 atIndex:1];
+                [e setBuffer:p_->bSCcen offset:0 atIndex:2];
+                [e setBuffer:p_->bSCdr offset:0 atIndex:3];
+                [e setBuffer:p_->bSCphi offset:0 atIndex:4];
+                [e setBuffer:p_->bSCidx offset:0 atIndex:5];
+                const uint32_t PP[2] = { np32, static_cast<uint32_t>(plan.ngrid) };
+                [e setBytes:PP length:sizeof(PP) atIndex:6];
+                [e dispatchThreads:grid threadsPerThreadgroup:tg];
+
+                [e setComputePipelineState:p_->pSCs];
+                [e setBuffer:p_->bT offset:0 atIndex:0];
+                [e setBuffer:p_->bSCphi offset:0 atIndex:1];
+                [e setBuffer:p_->bSCidx offset:0 atIndex:2];
+                [e setBuffer:p_->bSCdr offset:0 atIndex:3];
+                [e setBuffer:p_->bCurrent offset:0 atIndex:4];
+                [e setBuffer:p_->bEZP offset:0 atIndex:5];
+                [e setBuffer:p_->bSCout offset:0 atIndex:6];
+                [e setBytes:&S length:sizeof(S) atIndex:7];
+                [e dispatchThreadgroups:MTLSizeMake(ns, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                useSR = 1;
+            }
+        }
+        P.useSR = useSR;
+
         [e setComputePipelineState:p_->pPush];
         [e setBuffer:p_->bG offset:0 atIndex:0];
         [e setBuffer:p_->bT offset:0 atIndex:1];
@@ -1468,6 +1792,7 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
                                  : 0;
             [e setBuffer:p_->bField[k] offset:0 atIndex:8 + i];
         }
+        [e setBuffer:p_->bEZP offset:0 atIndex:12];
         [e dispatchThreads:grid threadsPerThreadgroup:tg];
 
         // Incoherent radiation first, then the wake, which is the order
@@ -1510,6 +1835,20 @@ bool MetalEngine::beamStep(Beam *beam, Undulator *und,
         // TrackBeam::track applies the corrector on the closing half step only,
         // which is why the kick is attached here and not to the opening one.
         encTrack(cx * gamma0, cy * gamma0, false);   // second half step
+
+        // The space-charge solve also produces the SSCfield diagnostic, one
+        // number per slice, which the CPU path writes as it goes. It has to
+        // come back to the host before the diagnostics of this step are
+        // assembled, so this is the one place the engine drains itself in the
+        // middle of a run. Only decks with short-range space charge pay it, and
+        // they are paying far more for the solve itself.
+        if (useSR != 0) {
+            p_->sync();
+            const float *sc = (const float *)[p_->bSCout contents];
+            for (int is = 0; is < ns; is++) {
+                beam->setSCField(is, sc[is]);
+            }
+        }
     }
     p_->syncIfFull();
     return true;
