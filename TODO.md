@@ -19,17 +19,30 @@ duplicates `b997669` exactly, and `959012c` contains `b815d7a` plus changes of i
 rebase onto the new master should drop the first and keep only the `Diagnostic.cpp` half of
 the second.
 
-### Ready to send, branched off the merged master
+### Sent, as drafts
 
-| branch | commit | title |
+| PR | branch | title |
 |---|---|---|
-| `fix/wallclock-timer` | `3d087ed` | Measure the wall clock with a clock |
-| `fix/onaxis-cell-even-ngrid` | `466ed83` | Take the on-axis field diagnostic from the axis when `ngrid` is even |
+| [#276](https://github.com/svenreiche/Genesis-1.3-Version4/pull/276) | `fix/wallclock-timer` | Report the wall clock time rather than the processor time at the end of a run |
+| [#277](https://github.com/svenreiche/Genesis-1.3-Version4/pull/277) | `fix/onaxis-cell-even-ngrid` | Take the on-axis field diagnostic from the axis when `ngrid` is even |
 
 Both are cherry-picked out of the GPU branch, build clean and are non-GPU. The second is the
 one worth explaining: on a CPU-only build with `ngrid = 256`, `Field/intensity-nearfield`
 peaks at 3.0e15 W/m^2 where the power and spot size imply 1.2e18 on axis — a factor of 400
 low, because the sampled cell is at the edge of the grid. With the fix it reads 1.5e18.
+
+### Not sent yet: the electron rest energy
+
+`eev` was 510999.06 eV and is now 510998.95069, the CODATA 2022 value, and the four places
+that open-coded it as the literal `511000` — `BeamSolver.cpp`, `Collective.cpp`,
+`EFieldSolver.h` and the backend — now use the constant. The name stays `eev` rather than
+becoming something clearer such as `mec2`, because it is upstream's own name with 33 uses in
+25 files, and renaming it would put a conflict in every one of them for no functional gain.
+
+Every result moves in its seventh significant digit. Measured on the SASE example at 8 ranks,
+old constant against new, the largest shift is 2.6e-06 in `Beam/energyspread` and everything
+else is at or below 7e-07 — three orders of magnitude below the GPU-to-CPU difference. GPU
+and CPU agreement is unaffected, since both paths take the value from the same place.
 
 ### Not worth sending
 
