@@ -33,10 +33,11 @@ CUDA  vs CPU over 1104 steps: max relative error, field 0.000212, beam 3.18e-06
 Metal vs CPU over 1104 steps: max relative error, field 0.000207, beam 3.18e-06
 ```
 
-That is the FP32 round-off level accumulated over the whole undulator, and the
-two backends land on the same number because they are the same arithmetic.
-Anything above about `1e-3` means the backend is broken on your machine rather
-than merely less precise.
+That is the FP32 round-off level accumulated over the whole undulator. The two
+backends land within a few percent of each other because they are the same
+arithmetic; they are not identical to the last bit, because their block
+reductions fold a warp in a different order. Anything above about `1e-3` means
+the backend is broken on your machine rather than merely less precise.
 
 ## 2. What is it worth?
 
@@ -90,8 +91,8 @@ because a plain relative error is misleading for the last two — see
 
 ## 3. Is it right for *my* deck?
 
-`validate.in` checks one configuration. `sweep.py` checks about fifty, which is
-what you want before trusting the backend with something you care about:
+`validate.in` checks one configuration. `sweep.py` checks seventy-three, which
+is what you want before trusting the backend with something you care about:
 
 ```sh
 python3 sweep.py --genesis ../../build-cuda/genesis4 --workdir /tmp/g4sweep
@@ -99,7 +100,8 @@ python3 sweep.py --genesis ../../build-cuda/genesis4 --workdir /tmp/g4sweep
 
 It writes every deck itself, so it needs nothing but the binary and an
 interpreter with `h5py`. `--only` takes a regular expression if you want a
-subset, and `--tier step` or `--tier run` selects one of the two kinds of check.
+subset, and `--tier step` or `--tier run` selects one of the two main kinds of
+check.
 
 The **step** tier runs `gpu_validate = true`, so the CPU and the GPU take the
 same step from the same state and the difference is reported before it can
@@ -127,6 +129,23 @@ would result if every step's round-off added coherently, which is the worst
 that round-off alone can do, and the end-to-end difference has to stay under
 it. A missed transfer is a finite error rather than a round-off one, so it goes
 straight through the bound.
+
+Both tiers compare the GPU against the CPU, which cannot police a quantity
+whose CPU value is itself too small or too chaotic to compare against. A
+bunching factor at a high harmonic is both: early in a run it is a cancelling
+sum near zero, where two correct answers differ relatively by order one, and
+late in a saturating run it is chaotic, so it exceeds any round-off bound
+however the deck is arranged.
+
+A **paired** case therefore runs the same deck twice on the GPU with one option
+changed, and requires the datasets that option cannot legitimately reach to
+come out the same. No CPU reference is involved. `aux_slot_layout` uses this on
+the diagnostic buffer, where the bunching factors and the auxiliary beam
+extrema are neighbours and the extrema are skipped entirely when their output
+is switched off: turning them off has to leave every bunching factor exactly
+where it was. The tolerance is 1e-6 rather than zero because the source
+deposition uses atomic adds, so a long run is not bit-reproducible even against
+itself; a paired deck is kept short enough to stay clear of that.
 
 Every case is checked against what it is supposed to do, so the runs that are
 *expected* to fail count as passes: the `refuse_*` cases must each die with the

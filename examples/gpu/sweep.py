@@ -45,10 +45,37 @@ A case may also expect to be refused. Physics the GPU does not implement must
 produce a hard error naming itself, never a quiet fallback that returns
 numbers from a different code path.
 
-Needs numpy and h5py for the run tier only.
+Both tiers compare the GPU against the CPU, which leaves one class of mistake
+invisible to them: a quantity whose CPU value is itself too small or too
+chaotic to compare against. A bunching factor at a high harmonic is both. Early
+in a run it is a cancelling sum near zero, where two correct answers differ
+relatively by order one; late in a saturating run it is chaotic, so it exceeds
+any round-off bound however the deck is arranged.
+
+A case may therefore also carry `paired`: a second deck differing in one option,
+and a set of datasets that the option cannot legitimately affect. The two GPU
+runs have to agree on those, and the comparison needs no CPU reference and
+almost no tolerance, which is what lets it police quantities a difference
+against the CPU cannot judge. It is the natural test for the diagnostic
+reduction, where every quantity shares one output buffer, so a mistake in the
+slot layout shows up as one output option silently changing another.
+
+The tolerance is small rather than zero because the backend is not bit-exact
+from one run to the next. The field source term is deposited with atomic adds,
+one per particle per grid corner, and floating-point addition is not
+associative, so the order the threads land in shows up in the last bits. The
+order only matters numerically once the summands span a wide range of
+exponents, which takes a bunched beam: over the first two dozen integration
+steps repeated runs here came out bit for bit identical, and over a full
+saturating run they part company at a few times 1e-7. A paired case is
+therefore kept short, both to stay in the reproducible regime and because it
+costs a second run.
+
+Needs numpy and h5py for the run tier and for paired cases.
 """
 
 import argparse
+import copy
 import os
 import re
 import shutil
@@ -146,9 +173,11 @@ TIME = "&time\ns0 = 0\nslen = 2e-8\nsample = 1\n&end\n"
 
 class Case:
     def __init__(self, name, tier="step", edit=None, pre="", extra="", tail="",
-                 lat=None, ranks=1, expect="ok", note=""):
+                 lat=None, ranks=1, expect="ok", note="", paired=None):
         self.name = name
         self.tier = tier
+        # (extra deck edits, [shell patterns for datasets they must not move])
+        self.paired = paired
         self.edit = edit or {}
         self.pre = pre              # namelists inserted before &field
         self.extra = extra          # namelists inserted before &track
@@ -221,6 +250,20 @@ case("field_harm_1234", edit={"track.bunchharm": 4},
      extra="".join("&field\nharm = %d\npower = 0\ndgrid = 2.0e-4\nngrid = 256\n"
                    "waist_size = 30e-6\n&end\n" % h for h in (2, 3, 4)))
 case("bunchharm_8", edit={"track.bunchharm": 8})
+
+# The deepest harmonic reduction with the auxiliary beam extrema alongside it.
+# The two together fill the diagnostic buffer to its end, so a mistake in the
+# slot layout has one overwrite the other, and the extrema are the last thing
+# the kernel writes and are skipped entirely when the output is not asked for.
+# Turning them off therefore has to leave every bunching factor exactly where
+# it was. Comparing against the CPU does not police this: the harmonics that
+# get overwritten are the weakest ones, and a transverse extremum is of the
+# same small magnitude, so the substituted value looks unremarkable. The deck
+# is short because that is all the reduction needs to be exercised.
+case("aux_slot_layout", edit={"track.bunchharm": 8, "track.zstop": 1.0},
+     paired=({"setup.exclude_aux_output": True},
+             ["Beam/bunching", "Beam/bunching[2-8]", "Beam/bunchingphase",
+              "Beam/bunchingphase[2-8]"]))
 
 # -- the beam ---------------------------------------------------------------
 case("detune_plus", edit={"setup.lambda0": 1.005e-10})
@@ -470,6 +513,61 @@ def compare(workdir, a, b):
     return (float(m.group(1)) if m else None), p.stdout
 
 
+def unmoved(workdir, a, b, patterns, tol=1e-6):
+    """Require two runs to agree on the datasets matching patterns.
+
+    Returns the empty string if they do, otherwise a verdict naming the first
+    dataset that moved, as a fraction of that dataset's own largest value. The
+    two decks differ only in an option that cannot reach these quantities, so
+    the tolerance covers nothing but the last bits of the atomic deposition
+    described at the top of this file.
+    """
+    import fnmatch
+    import h5py
+    import numpy
+
+    with h5py.File(os.path.join(workdir, a + ".out.h5"), "r") as fa, \
+         h5py.File(os.path.join(workdir, b + ".out.h5"), "r") as fb:
+        names = []
+        fa.visit(lambda n: names.append(n))
+        for pattern in patterns:
+            hit = fnmatch.filter(names, pattern)
+            if not hit:
+                return "no dataset matching %r in the output" % pattern
+            for n in sorted(hit):
+                if n not in fb:
+                    return "%s is missing from the paired run" % n
+                va, vb = numpy.array(fa[n]), numpy.array(fb[n])
+                if va.shape != vb.shape:
+                    return "%s changed shape in the paired run" % n
+                scale = float(numpy.abs(va).max()) or 1.0
+                off = float(numpy.abs(va - vb).max()) / scale
+                if off > tol:
+                    return "%s moved by %.3e of its own scale when the paired " \
+                           "option changed" % (n, off)
+    return ""
+
+
+def paired_run(genesis, args, case, done, gpu):
+    """Run the paired variant of a case and check the datasets it must not move.
+
+    `done` is the run that has already happened, on the same GPU setting, so
+    the two differ only in the paired option itself. Cases without a paired
+    variant return the empty string and cost nothing.
+    """
+    if not case.paired:
+        return ""
+    overlay, patterns = case.paired
+    alt = copy.copy(case)
+    alt.edit = dict(case.edit, **overlay)
+    name = case.name + "_paired"
+    out, _ = run(genesis, args.mpirun, args.workdir, alt, name, gpu, case.ranks)
+    if "*** Error" in out:
+        return "the paired run did not complete: " + next(
+            (l.strip() for l in out.splitlines() if "*** Error" in l), "?")
+    return unmoved(args.workdir, done, name, patterns)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--genesis", default=os.path.join(HERE, "..", "..",
@@ -545,8 +643,9 @@ def main():
                     elif field > args.field_tol or beam > args.beam_tol:
                         verdict = "OVER TOLERANCE"
                     else:
-                        verdict = "ok"
-                        if fb:
+                        verdict = paired_run(genesis, args, c, c.name,
+                                             "validate") or "ok"
+                        if fb and verdict == "ok":
                             verdict += ", %s/%s steps on the CPU" % (
                                 fb.group(1), fb.group(2))
         else:
@@ -577,8 +676,10 @@ def main():
                     print(text)
                 else:
                     field, beam = worst, bound
-                    verdict = ("ok" if worst <= args.run_margin * bound
-                               else "OVER TOLERANCE")
+                    if worst > args.run_margin * bound:
+                        verdict = "OVER TOLERANCE"
+                    else:
+                        verdict = paired_run(genesis, args, c, gpu, True) or "ok"
 
         print("%-26s %-5s %10s %10s  %s" % (
             c.name, c.tier,

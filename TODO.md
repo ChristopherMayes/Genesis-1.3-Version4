@@ -406,6 +406,18 @@ question, cuFFT, and the multi-GPU section covering device selection from the MP
 - **The busy percentage is a saturation indicator, not a calibrated fraction.** Device
   timestamps and the host clock need not agree to better than a few percent; on WSL2 a
   saturated run reports 100–106%. It answers 95% against 50%, not 95% against 100%.
+- **The diagnostic output buffer's slot layout is written out four times** — each backend's
+  kernel and each backend's host-side read — and two of the four have already been wrong.
+  Bunching occupies 12–27 at eight harmonics and the aux extrema now start at 28 with a stride
+  of 48. Nothing about a wrong slot looks wrong, because every entry is a plausible float, so
+  changes here need the `aux_slot_layout` sweep case rather than a careful re-reading.
+- **Neither backend is bit-reproducible run to run**, and it is not a bug. The source
+  deposition is one atomic add per particle per grid corner; the adds commute but their
+  rounding does not, and the thread order varies. Measured on the 1104-step steady-state deck:
+  two runs of the same binary are identical for 26 output steps and then diverge to 5.7e-07,
+  while the CPU path is identical to the last bit. It only shows once the summands span a wide
+  range of exponents, which is why it starts part way in. Anything resting on two GPU runs
+  agreeing exactly has to be kept short; that is why `aux_slot_layout` uses `zstop = 1`.
 
 ## 3. Housekeeping / possible upstream reports
 
