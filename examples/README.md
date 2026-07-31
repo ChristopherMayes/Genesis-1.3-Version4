@@ -20,7 +20,7 @@ Examples are HGHG and EEHG cases, where the energy modulation and energy-depende
 
 ![Example 4, Fig 2](Example4-HGHG/Plots/Figure_2.png)
 
-## GPU on Apple Silicon
-In [metal-gpu](metal-gpu/), the Metal GPU backend is checked against the CPU on a
+## GPU acceleration
+In [gpu](gpu/), the GPU backend is checked against the CPU on a
 steady-state case and then timed on a 500-slice SASE run. See
 [manual/GPU.md](../manual/GPU.md) for the full description.

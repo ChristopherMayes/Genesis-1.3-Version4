@@ -3,6 +3,16 @@ project(Genesis_1_3_Version4 CXX C)
 
 option(USE_DPI "Use diagnostic plugin interface" OFF)
 option(ENABLE_METAL "Build the Apple Silicon GPU backend (macOS only)" OFF)
+option(ENABLE_CUDA "Build the NVIDIA GPU backend" OFF)
+
+# Which NVIDIA architectures the CUDA backend is compiled for. The default
+# covers the three cards it is written against -- A100 (80), L4 (89) and the
+# consumer Blackwell parts such as the RTX 5080 (120) -- and adds PTX for the
+# last of them so that a newer card still runs, by JIT, rather than failing to
+# launch. Set it to "native" to build only for the card in the machine, which
+# is quicker and is what to use while developing.
+set(CUDA_ARCHS "80;89;120;120-virtual" CACHE STRING
+    "CMAKE_CUDA_ARCHITECTURES for the CUDA backend (e.g. native, or 80;89;120)")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENTIONS OFF)
@@ -96,6 +106,37 @@ if(ENABLE_METAL)
    list(APPEND _libraries ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
    set(SRC_METAL src/Core/MetalEngine.mm)
    message(STATUS "Metal GPU backend enabled")
+endif()
+
+# NVIDIA GPU backend. One translation unit of CUDA C++, behind the G4_CUDA
+# macro, so a build without this option takes exactly the paths it always took:
+# the tracking loop talks to GPUEngine (always compiled, see
+# src/Core/GPUEngine.cpp), which then has no backend to offer it and says so.
+#
+# The kernels are specialised on the transverse grid size at compile time, so
+# there is no runtime compilation and nothing to ship beside the binary.
+if(ENABLE_CUDA)
+   if(CMAKE_VERSION VERSION_LESS 3.18)
+      message(FATAL_ERROR "ENABLE_CUDA needs CMake 3.18 or newer for "
+                          "CMAKE_CUDA_ARCHITECTURES; this is ${CMAKE_VERSION}")
+   endif()
+   # nvcc drives a host compiler of its own choosing unless told otherwise,
+   # which in a conda environment is the system gcc rather than the one the
+   # rest of the build uses. The two then disagree about the C++ ABI and the
+   # link fails in a way that is hard to read, so pin it here.
+   if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER)
+      set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+   endif()
+   set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCHS})
+   enable_language(CUDA)
+   set(CMAKE_CUDA_STANDARD 17)
+   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+   # Keep IEEE semantics. The single-precision reformulations in CudaEngine.cu
+   # are chosen against a known rounding behaviour, and -use_fast_math would
+   # quietly replace the transcendentals under them.
+   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+   set(SRC_CUDA src/Core/CudaEngine.cu)
+   message(STATUS "CUDA GPU backend enabled, architectures ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 
@@ -198,6 +239,7 @@ add_library(genesis13 STATIC
         src/Main/Wake.cpp
         ${SRC_DPI}
         ${SRC_METAL}
+        ${SRC_CUDA}
 )
 
 
@@ -223,6 +265,15 @@ if(ENABLE_METAL)
    # Automatic reference counting for the Objective-C objects held by the engine.
    set_source_files_properties(src/Core/MetalEngine.mm PROPERTIES
            COMPILE_OPTIONS "-fobjc-arc")
+endif()
+
+if(ENABLE_CUDA)
+   target_compile_definitions(genesis13 PRIVATE G4_CUDA)
+   # The engine chooses its device from the rank's position within its node, so
+   # the CUDA translation unit needs the MPI headers as well.
+   target_include_directories(genesis13 PRIVATE ${MPI_C_INCLUDE_DIRS} ${MPI_INCLUDE_PATH})
+   find_package(CUDAToolkit REQUIRED)
+   target_link_libraries(genesis13 PUBLIC CUDA::cudart)
 endif()
 
 

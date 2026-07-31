@@ -8,7 +8,7 @@
 
 [Output Files](#main-output-file)
 
-[GPU Acceleration on Apple Silicon](#gpu-acceleration-on-apple-silicon)
+[GPU Acceleration](#gpu-acceleration)
 
 <div style="page-break-after: always; visibility: hidden"> \pagebreak </div>
 

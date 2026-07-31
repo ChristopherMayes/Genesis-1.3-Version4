@@ -345,7 +345,7 @@ inline float tg_max(float v, threadgroup float* sh, uint t){
 }
 
 constant uint MAXBH = 8;    // largest bunchharm handled on the GPU
-constant uint BSTRIDE = 32; // floats of output per slice
+constant uint BSTRIDE = 48; // floats of output per slice
 constant uint FSTRIDE = 16;
 
 struct BMPar { float gref; uint npart, nharm, doAux; };
@@ -421,8 +421,12 @@ kernel void beam_moments(const device float* X  [[buffer(0)]],
     pymn=tg_min(pymn,sh,t); pymx=tg_max(pymx,sh,t);
     gmn=tg_min(gmn,sh,t); gmx=tg_max(gmx,sh,t);
     if (t == 0){
-        r[20]=xmn; r[21]=xmx; r[22]=ymn; r[23]=ymx;
-        r[24]=pxmn; r[25]=pxmx; r[26]=pymn; r[27]=pymx; r[28]=gmn; r[29]=gmx;
+        // Slot 28 and up, clear of the bunching factors, which reach slot 27 at
+        // the eight harmonics the reduction supports. They used to start at 20,
+        // which overlapped and silently replaced harmonics five to eight
+        // whenever a deck asked for both.
+        r[28]=xmn; r[29]=xmx; r[30]=ymn; r[31]=ymx;
+        r[32]=pxmn; r[33]=pxmx; r[34]=pymn; r[35]=pymx; r[36]=gmn; r[37]=gmx;
     }
 }
 
@@ -979,7 +983,7 @@ struct PushPar {
     uint32_t onGrid[kMaxHarm];
 };
 
-enum { kMaxBunchHarm = 8, kBeamStride = 32, kFieldStride = 16 };
+enum { kMaxBunchHarm = 8, kBeamStride = 48, kFieldStride = 16 };
 
 // Radial grid points the space-charge solve can hold in threadgroup memory.
 enum { kMaxSCGrid = 384 };
@@ -2040,12 +2044,12 @@ bool MetalEngine::beamMoments(int nharm, bool wantAux, BeamSliceMoments &out) co
             out.bim[static_cast<size_t>(is) * nharm + h] = s[13 + 2 * h];
         }
         if (wantAux) {
-            out.xmin[is] = s[20]; out.xmax[is] = s[21];
-            out.ymin[is] = s[22]; out.ymax[is] = s[23];
-            out.pxmin[is] = s[24]; out.pxmax[is] = s[25];
-            out.pymin[is] = s[26]; out.pymax[is] = s[27];
-            out.gmin[is] = p_->gref + s[28];
-            out.gmax[is] = p_->gref + s[29];
+            out.xmin[is] = s[28]; out.xmax[is] = s[29];
+            out.ymin[is] = s[30]; out.ymax[is] = s[31];
+            out.pxmin[is] = s[32]; out.pxmax[is] = s[33];
+            out.pymin[is] = s[34]; out.pymax[is] = s[35];
+            out.gmin[is] = p_->gref + s[36];
+            out.gmax[is] = p_->gref + s[37];
         }
     }
     return true;

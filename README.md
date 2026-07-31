@@ -21,7 +21,7 @@ Version 4.6.12 has been released
 * [Example 2 - Field and Particle Dumps](examples/Example2-Dumps/)
 * [Example 3 - Time-dependent Simulation](examples/Example3-TimeDependent/)
 * [Example 4 - HGHG Simulation](examples/Example4-HGHG/)
-* [GPU on Apple Silicon](examples/metal-gpu/)
+* [GPU acceleration](examples/gpu/)
 
 
 

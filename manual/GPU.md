@@ -1,8 +1,10 @@
 # GPU acceleration
 
-Genesis 4 has an optional GPU backend for the tracking loop. It is opt-in at build time and again in each `&track` block, so a binary built with it behaves exactly as it did before unless a deck asks for it. The only backend at present is for Apple Silicon and is written against Metal; the interface it implements is not Apple specific, and the final section of this chapter describes what a backend for another vendor would have to provide.
+Genesis 4 has an optional GPU backend for the tracking loop. It is opt-in at build time and again in each `&track` block, so a binary built with it behaves exactly as it did before unless a deck asks for it.
 
-Everything the Apple backend does is in single precision. That is not a tuning choice: Apple GPUs have no double precision at all and the Metal shading language has no `double` type. Agreement with the CPU path is therefore at the single-precision level, a few times `1e-4` on field amplitudes for a saturating run, and the section on [accuracy](#what-agreement-to-expect) puts that number in context against the things a user changes without thinking about them.
+There are two backends. `ENABLE_METAL` builds the Apple Silicon one, written against Metal; `ENABLE_CUDA` builds the NVIDIA one, written against CUDA and tested on an RTX 5080, an L4 and an A100. They implement the same interface, `GPUEngine`, and the tracking loop cannot tell them apart. The physics, the transform and the order of operations are the same code transcribed, so the two produce the same numbers; what differs between them is the memory model, and everything that follows from a discrete card having its own.
+
+Everything both backends do is in single precision. On Apple that is not a choice at all, since Apple GPUs have no double precision and the Metal shading language has no `double` type. On NVIDIA it is a choice, and the reasoning is in [double precision](#double-precision-on-nvidia). Agreement with the CPU path is therefore at the single-precision level, a few times `1e-4` on field amplitudes for a saturating run, and the section on [accuracy](#what-agreement-to-expect) puts that number in context against the things a user changes without thinking about them.
 
 - [Requirements](#requirements)
 - [Building](#building)
@@ -12,31 +14,56 @@ Everything the Apple backend does is in single precision. That is not a tuning c
 - [The worked example](#the-worked-example)
 - [What agreement to expect](#what-agreement-to-expect)
 - [Performance notes](#performance-notes)
+- [Running on more than one GPU](#running-on-more-than-one-gpu)
 - [Where the code lives](#where-the-code-lives)
-- [Porting to another GPU](#porting-to-another-gpu), including [running on several at once](#more-than-one-gpu)
+- [Porting to another GPU](#porting-to-another-gpu)
 
 ## Requirements
 
-An Apple Silicon Mac is required. The backend refuses to start on a device without unified memory, which rules out the Intel Macs with discrete GPUs.
+**NVIDIA.** A card of compute capability 7.0 or newer, a driver, and the CUDA toolkit. The backend is compiled for the architectures in `CUDA_ARCHS`, which defaults to `80;89;120;120-virtual` — an A100, an L4, and the consumer Blackwell parts such as the RTX 5080, plus PTX so that a newer card still runs by JIT rather than failing to launch. Nothing is compiled at run time, so a binary built this way needs only the driver on the machine it runs on.
 
-The command line developer tools supply the Metal framework headers and are installed with `xcode-select --install`; a full Xcode installation also works. The offline `metal` compiler is not needed, because the shaders are compiled from source when the first `&track` block starts.
+Memory is the practical limit rather than the architecture. The resident state is `nslice * ngrid^2` complex floats per harmonic plus about as much again in scratch, and the line printed at the start of a `&track` block reports it; a deck that does not fit is refused by name, with what it wanted and what was free. Splitting the run over more MPI ranks divides that, and over more cards divides it again — see [running on more than one GPU](#running-on-more-than-one-gpu).
 
-The remaining dependencies are the same as for a CPU build: a C++17 toolchain, MPI, HDF5 and FFTW.
+**Apple.** An Apple Silicon Mac. The backend refuses to start on a device without unified memory, which rules out the Intel Macs with discrete GPUs. The command line developer tools supply the Metal framework headers and are installed with `xcode-select --install`; a full Xcode installation also works. The offline `metal` compiler is not needed, because the shaders are compiled from source when the first `&track` block starts.
+
+The remaining dependencies are the same as for a CPU build in both cases: a C++17 toolchain, MPI, HDF5 and FFTW.
 
 ## Building
 
-The conda-forge toolchain is the least surprising way to get the four dependencies to agree with each other on macOS.
+The conda-forge toolchain is the least surprising way to get the dependencies to agree with each other.
+
+### NVIDIA
+
+```sh
+conda create -n genesis4-cuda -c conda-forge \
+    cxx-compiler c-compiler cmake make pkg-config \
+    mpich "hdf5=*=mpi_mpich_*" fftw \
+    cuda-nvcc cuda-cudart-dev cuda-version=13.2
+conda activate genesis4-cuda
+```
+
+Match `cuda-version` to what the driver supports; `nvidia-smi` prints it in the top right. A toolkit newer than the driver's CUDA version usually still works within the same major release, but there is no reason to find out the hard way.
+
+```sh
+cmake -S . -B build-cuda \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH=$CONDA_PREFIX \
+    -DENABLE_CUDA=ON
+cmake --build build-cuda -j8
+```
+
+Look for `-- CUDA GPU backend enabled, architectures 80;89;120;120-virtual`. Add `-DCUDA_ARCHS=native` to compile only for the card in this machine, which is quicker and is what to use while developing; `-DCUDA_ARCHS=80` or similar pins one target for a cluster whose nodes are uniform.
+
+CMake 3.18 or newer is required with `ENABLE_CUDA`, for `CMAKE_CUDA_ARCHITECTURES`. The build pins `nvcc`'s host compiler to `CMAKE_CXX_COMPILER`, because `nvcc` otherwise picks the system compiler and the two then disagree about the C++ ABI in a way that only shows up at link time.
+
+### Apple Silicon
 
 ```sh
 conda create -n genesis4-dev -c conda-forge \
     cxx-compiler c-compiler cmake make pkg-config \
     mpich "hdf5=*=mpi_mpich_*" fftw
 conda activate genesis4-dev
-```
 
-Configure with the backend enabled and build in the usual way.
-
-```sh
 cmake -S . -B build-metal \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH=$CONDA_PREFIX \
@@ -46,7 +73,7 @@ cmake --build build-metal -j8
 
 Look for `-- Metal GPU backend enabled` in the configure output. `ENABLE_METAL` defaults to `OFF` and is a hard error on anything that is not macOS.
 
-Two properties of `CMakeLists.txt` are worth knowing on a Mac. It will use `/opt/local/bin/h5pcc` as the C++ compiler if that file exists, overriding `CMAKE_CXX_COMPILER`, so a MacPorts installation can quietly hijack a conda build. And if FFTW is not found the build still succeeds, but a deck asking for `fft_fieldsolver = true` is then given the ADI solver without being told, so check for `-- FFTW found` as well.
+Two properties of `CMakeLists.txt` are worth knowing on a Mac. It will use `/opt/local/bin/h5pcc` as the C++ compiler if that file exists, overriding `CMAKE_CXX_COMPILER`, so a MacPorts installation can quietly hijack a conda build. And if FFTW is not found the build still succeeds, but a deck asking for `fft_fieldsolver = true` is then given the ADI solver without being told, so check for `-- FFTW found` as well. That last point applies to both backends.
 
 ## Switching it on
 
@@ -70,25 +97,35 @@ fft_fieldsolver = true
 
 Setting `gpu_validate = true` additionally runs the CPU path at every step and reports the largest relative difference at the end. This is a test mode and is slower than either path on its own, because it performs both. `fft_fieldsolver = true` belongs with it: without it the CPU half of the comparison uses the ADI solver, and the reported difference then measures the two solvers against each other rather than the two processors.
 
-At the end of a GPU `&track` block one line reports what the device did.
+At the start of a GPU `&track` block one line names the device and the resident footprint, and at the end another reports what the device did.
 
 ```
-Metal: 196 steps in 4.09731 s, device busy 3.79265 s (93%)
+CUDA backend: NVIDIA GeForce RTX 5080, 1032 MB resident, gamma_ref = 11357.8
+  host transfer check: field 2.9e-08   beam 4.4e-08 (relative, FP32 rounding is ~1e-7)
+...
+CUDA: 196 steps in 1.71 s, device busy 1.62 s (95%)
 ```
 
-The first figure is the wall clock of the tracking loop and the second is the time the device itself spent executing, which Metal timestamps on every command buffer at no cost. The percentage answers the question worth asking before reaching for more hardware: a device that is already busy will not go faster if more MPI ranks are pointed at it, and one that is idling means the host is the limit. Neither figure is Genesis' own `Total Wall Clock Time`, which covers the whole program including loading and output.
+The first figure is the wall clock of the tracking loop and the second is the time the device itself spent executing. The percentage answers the question worth asking before reaching for more hardware: a device that is already busy will not go faster if more MPI ranks are pointed at it, and one that is idling means the host is the limit. Neither figure is Genesis' own `Total Wall Clock Time`, which covers the whole program including loading and output.
+
+Read the percentage as a saturation indicator rather than as a calibrated fraction, particularly on CUDA. Metal timestamps every command buffer, so its figure is the sum of the intervals the device was executing. CUDA brackets each engine call with a pair of events, which keeps host work between calls out of the measurement, but the event records cost device time of their own and the device timestamps and the host clock need not agree to better than a few percent: a saturated run reports between 100% and 106%. What the number answers is 95% against 50%, not 95% against 100%.
 
 A deck that asks for the GPU and cannot have it is an error rather than a silent fallback, because the alternative is a run that quietly produces CPU numbers and CPU timings under a GPU label. Each message names the reason.
 
 ```
 *** Error: gpu = true in &track, but this binary was built without the GPU
-    backend. Reconfigure with -DENABLE_METAL=ON.
-*** Error: gpu = true in &track, but ngrid = 151 is not supported by the Metal
+    backend. Reconfigure with -DENABLE_CUDA=ON for an NVIDIA card or
+    -DENABLE_METAL=ON on an Apple Silicon Mac
+*** Error: gpu = true in &track, but ngrid = 151 is not supported by the CUDA
     field solver, which handles powers of two from 64 to 1024. Set ngrid = 128
     in &field. ...
-*** Error: gpu = true in &track, but ngrid = 512 in &efield, but the GPU
-    space-charge solve holds the radial arrays in threadgroup memory and
-    handles 3 to 384
+*** Error: gpu = true in &track, but ngrid = 2048 in &efield, but the GPU
+    space-charge solve holds the radial arrays in shared memory and NVIDIA
+    GeForce RTX 5080 has room for 3 to 1583
+*** Error: gpu = true in &track, but the resident buffers do not fit: 21140 MB
+    wanted, 15290 MB free of 16303 MB on NVIDIA GeForce RTX 5080. Spread the
+    run over more MPI ranks, and more cards if there are any, or reduce ngrid
+    or the particle count
 ```
 
 ## What is supported
@@ -106,7 +143,7 @@ The GPU runs the source deposition, the field propagation, the transverse map, t
 | chicanes | supported; the transfer map rides on the opening half step and the R56 shear sits before the closing one |
 | wakefields (`&wake`) | supported, including the resistive wall, geometric and roughness wakes and the external loss |
 | incoherent radiation (`&sponrad`) | supported; both the loss and the spread, reproducing the CPU run rather than only its statistics |
-| space charge (`&efield`) | supported, long and short range; the radial grid runs to 384 points |
+| space charge (`&efield`) | supported, long and short range; the radial grid is limited by the shared memory of the device, 384 points on Metal and 1583 on a card with 100 KB per block |
 | `one4one` | not supported; the backend requires a rectangular particle array |
 
 Everything the backend cannot do is a hard error rather than a fallback, and the reason is the same in each case. A run that completes and writes a plausible output file, having quietly done something other than what the deck asked for, is the failure this design works hardest to avoid. An ADI deck would be propagated by FFT instead, and a `bunchharm` above eight would be answered from host particle arrays that are stale, because the particles stay on the GPU. Neither would announce itself in the output file.
@@ -117,7 +154,7 @@ No lattice element falls back to the CPU. The machinery for a fallback is still 
 
 The restriction to powers of two is the one users notice. Genesis decks traditionally use an odd `ngrid` so that a grid point sits exactly on the axis, but that convention buys nothing physically and costs a great deal in transform structure: `ngrid = 255` factors as 3 x 5 x 17, which is a poor length for an FFT and runs about 1.5 times slower than 256 even on the CPU. The error message names the nearest supported size.
 
-Each grid size gets its own specialisation of the transform. The kernel is a four-step Cooley-Tukey decomposition `N = REGS x LANES`, in which every thread holds `REGS` points in registers, performs a short DFT over them, exchanges through threadgroup memory, and finishes with `LANES`-point DFTs. The two factors are chosen per grid size and injected into the shader as preprocessor macros when the Metal library is compiled, so there is no runtime branching in the inner loop.
+Each grid size gets its own specialisation of the transform. The kernel is a four-step Cooley-Tukey decomposition `N = REGS x LANES`, in which every thread holds `REGS` points in registers, performs a short DFT over them, exchanges through shared memory, and finishes with `LANES`-point DFTs. The two factors are chosen per grid size, so there is no runtime branching in the inner loop: Metal injects them into the shader as preprocessor macros when it compiles the library at startup, and CUDA takes them as template parameters and instantiates every supported size at build time. The two backends use the same `REGS x LANES` for a given grid and therefore do the same arithmetic in the same order; they differ only in how many transforms share a block, which is a blocking choice and affects nothing but speed.
 
 | `ngrid` | REGS x LANES | radices used | tracking loop | device busy |
 |---:|---:|---|---:|---:|
@@ -185,24 +222,24 @@ For scale, on the steady-state deck the radiation changes `Field/power` by 25%, 
 
 An `&efield` block works on the GPU, both the long-range field and the short-range solve that `nz` and `nphi` switch on.
 
-The short-range solve is a set of azimuthal modes `m` and longitudinal modes `l`. For each pair the particles of a slice are binned in radius into a complex source term, a tridiagonal system is solved on the radial grid, and the result is gathered back onto the particles. That maps to one threadgroup per slice with the radial arrays in threadgroup memory. The tridiagonal solve is a recurrence, so a single thread runs it while the others wait; the grid is small enough that the parallel alternatives cost more than they save.
+The short-range solve is a set of azimuthal modes `m` and longitudinal modes `l`. For each pair the particles of a slice are binned in radius into a complex source term, a tridiagonal system is solved on the radial grid, and the result is gathered back onto the particles. That maps to one block per slice with the radial arrays in shared memory. The tridiagonal solve is a recurrence, so a single thread runs it while the others wait; the grid is small enough that the parallel alternatives cost more than they save.
 
 One part cannot stay on the device. `rmax` grows to hold the widest slice seen so far, and it does so as the slices are visited in order and persists across the whole run, so slice *k* is solved on a grid that already accounts for the slices before it. A backend that sized each slice independently would agree with the CPU only until the first slice wider than the grid. An analysis pass therefore reduces each slice to a centroid and a bounding radius, the host replays that growth exactly as `analyseBeam` does, including the message when the grid is enlarged, and the resulting spacing comes back per slice. That costs one round trip per step and three floats per slice, rather than the particles.
 
-The radial grid is limited to 384 points, because the six complex and four real arrays of the solve come to about 72 bytes per point and a threadgroup has 32 KB of memory. A larger grid is refused by name. The default is 100.
+The radial grid is limited by the shared memory of one block, because the six complex and four real arrays of the solve come to 64 bytes per point and they all have to live there: 384 points on Metal's 32 KB, and 1584 on a card offering 100 KB. The CUDA backend reads the limit from the device rather than assuming one, opts in to the larger allocation where that is needed, and names the actual number when it refuses. The default is 100, so this is a limit few decks reach.
 
 The `SSCfield` diagnostic deserves a warning, because it is the natural thing to check and it is misleading in two separate ways. It reports the `l = 1` mode, and at the head of a run there is no bunching, so its source term is a sum of thousands of unit phasors that should cancel to nothing; what survives is the arithmetic, which is 1e-18 in the CPU's double precision and 1e-10 in the GPU's single precision, a ratio of 1e8 between two numbers that are both zero. It also reports whichever azimuthal mode came last, since the CPU writes it once per `m`, so with `nphi > 0` it is a dipole or higher and averages to noise for a round beam. Compared where the field is real, on the same bunched particles, the two paths agree to 4.0e-07 of peak with a correlation of 1.000000000.
 
 ## The worked example
 
-Everything below is in `examples/metal-gpu/` and takes a few minutes.
+Everything below is in `examples/gpu/` and takes a few minutes.
 
 ### 1. The self-check
 
 ```sh
-cd examples/metal-gpu
+cd examples/gpu
 export FI_PROVIDER=tcp
-../../build-metal/genesis4 validate.in
+../../build-cuda/genesis4 validate.in       # or ../../build-metal/genesis4
 ```
 
 Set `FI_PROVIDER=tcp` before anything else if you are using conda's MPICH; the [performance notes](#performance-notes) explain why. It is worth 40% even on this single-rank run, which performs no communication at all, and a factor of four on a run with several ranks.
@@ -210,16 +247,17 @@ Set `FI_PROVIDER=tcp` before anything else if you are using conda's MPICH; the [
 This is a steady-state run of the ARAMIS undulator with the shot noise switched off and a seeded field, so it is deterministic, and it runs both paths and compares them at every step. The last line is the point of it.
 
 ```
+CUDA vs CPU over 1104 steps: max relative error, field 0.000212, beam 3.18e-06
 Metal vs CPU over 1104 steps: max relative error, field 0.000207, beam 3.18e-06
 ```
 
-Those two numbers are the single-precision round-off level accumulated over 1104 steps. If the run on your machine reports something similar then the backend is working. A number above about `1e-3` means it is wrong rather than merely less precise.
+Those two numbers are the single-precision round-off level accumulated over 1104 steps. That the two backends land within 2% of each other on the field and agree to three figures on the beam is the point of writing them as transcriptions of one another: the residual is the arithmetic, not the vendor. If the run on your machine reports something similar then the backend is working. A number above about `1e-3` means it is wrong rather than merely less precise.
 
 At the start it also prints the device it selected and a check that the upload round trip is clean before any physics happens.
 
 ```
-Metal backend: Apple M3 Max, 1 MB resident, gamma_ref = 11357.8
-  host transfer check: field 4.5e-08   beam 4.4e-08 (relative, FP32 rounding is ~1e-7)
+CUDA backend: NVIDIA GeForce RTX 5080, 1 MB resident, gamma_ref = 11357.8
+  host transfer check: field 2.9e-08   beam 4.4e-08 (relative, FP32 rounding is ~1e-7)
 ```
 
 The timing line from this deck is not a performance figure and should not be read as one, because `gpu_validate` runs the CPU path as well and a steady-state deck has a single slice, so there is very little for the device to do. The performance notes give the same line for a deck that is representative.
@@ -230,8 +268,8 @@ The timing line from this deck is not a performance figure and should not be rea
 
 ```sh
 export FI_PROVIDER=tcp
-mpirun -n 8 ../../build-metal/genesis4 sase_cpu.in
-mpirun -n 8 ../../build-metal/genesis4 sase_gpu.in
+mpirun -n 8 ../../build-cuda/genesis4 sase_cpu.in
+mpirun -n 8 ../../build-cuda/genesis4 sase_gpu.in
 python3 compare.py sase_cpu.out.h5 sase_gpu.out.h5
 ```
 
@@ -240,7 +278,7 @@ Run both at the same number of ranks. Genesis pads the slice count up to a multi
 `compare.py` needs `h5py` and `numpy`, which the build environment above does not have. Use whichever environment you normally analyse Genesis output in, or add them to it.
 
 ```sh
-conda install -n genesis4-dev -c conda-forge h5py numpy
+conda install -n genesis4-cuda -c conda-forge h5py numpy
 ```
 
 ### 3. The full validation matrix
@@ -248,15 +286,21 @@ conda install -n genesis4-dev -c conda-forge h5py numpy
 `sweep.py` runs seventy-two decks against the CPU path on the same inputs and prints one line per case. Sixty-one of them compare per-step differences under `gpu_validate`, seven being decks the backend must refuse; the remaining eleven run to completion and compare the output against a bound derived from the per-step figure and the step count. A case that falls back to the CPU where it should not is a failure, because a fallback gives the right answer by the slow route and is exactly how an unported element would hide.
 
 ```sh
-cd examples/metal-gpu
-python3 sweep.py --workdir /tmp/g4sweep
+cd examples/gpu
+python3 sweep.py --genesis ../../build-cuda/genesis4 --workdir /tmp/g4sweep
 ```
 
 It needs the same `h5py` and `numpy` as `compare.py` and takes some tens of minutes. Pass `--tier step` or `--tier run` for one tier only, and `--only <regex>` to select cases by name. This is the check to run after changing anything in the backend.
 
 The matrix covers planar and helical undulators, tapers, phase shifters, undulator and quadrupole offsets, gradients and roll-off, field and orbit errors, every supported grid size, harmonics, the source filter, all four wakefield models, incoherent radiation, long-range and short-range space charge, chicanes, correctors, time-dependent and time-periodic running, dumps and multiple `&track` blocks.
 
-`tools/fftcheck.mm` is a smaller and more direct check of the FFT kernels alone. It extracts the shader source from `src/Core/MetalEngine.mm`, so it always tests the code Genesis actually runs, compiles it for one grid shape, and compares a row transform, a column transform and a complete four-pass solve against a direct double-precision DFT. It is not part of the build, since it is a diagnostic rather than a regression test, and it is what to reach for when the sweep says the field is wrong but not where.
+`tools/fftcheck` is a smaller and more direct check of the FFT kernels alone: it compares a row transform, a column transform, the out-of-place row pass the far-field diagnostic uses and a complete four-pass solve against a direct double-precision DFT. It is not part of the build, since it is a diagnostic rather than a regression test, and it is what to reach for when the sweep says the field is wrong but not where. Each version tests the code Genesis actually runs rather than a copy of it -- `fftcheck.cu` includes the same `src/Core/CudaFFT.cuh` the field solve does, and `fftcheck.mm` extracts the shader string out of `src/Core/MetalEngine.mm`.
+
+```sh
+nvcc -std=c++17 -O2 -arch=native -Isrc/Core tools/fftcheck.cu -o /tmp/fftcheck
+/tmp/fftcheck            # every supported shape
+/tmp/fftcheck 256        # just one
+```
 
 ```sh
 clang++ -std=c++17 -fobjc-arc -framework Metal -framework Foundation \
@@ -264,23 +308,30 @@ clang++ -std=c++17 -fobjc-arc -framework Metal -framework Foundation \
 /tmp/fftcheck 256 16 16 8 16      # ngrid lanes regs rowsPerTG colsPerTG
 ```
 
-Run it from the top of the source tree, since it reads the shader out of `src/Core/MetalEngine.mm` by a relative path. The five shapes the backend itself uses are `64 8 8 16 16`, `128 8 16 16 16`, `256 16 16 8 16`, `512 16 32 4 8` and `1024 32 32 2 4`, taken from `pickFFTShape` in that file. All five report a row and column error of a few times `1e-6` against a scale of order ten, and a round trip through the complete solve accurate to `4e-07`.
+Run either from the top of the source tree. The CUDA one enumerates the shapes itself from `pickFFTShape`; the Metal one has to be given them, and they are `64 8 8 16 16`, `128 8 16 16 16`, `256 16 16 8 16`, `512 16 32 4 8` and `1024 32 32 2 4`. All five report a row and column error of a few times `1e-6` against a scale of order ten, and a round trip through the complete solve accurate to `4e-07`.
+
+```
+N=256   16x16 rows:  max abs err 1.769e-06  (scale 1.549e+01)  -> ok
+N=256   16x16 cols:  max abs err 1.629e-06  (scale 1.517e+01)  -> ok
+N=256   16x16 solve: max abs err 3.210e-07  (scale 7.055e-01)  -> ok
+N=256   16x16 out:   max abs err 1.822e-06  (scale 1.448e+01)  -> ok
+```
 
 ## What agreement to expect
 
-The reference numbers below are from an M3 Max with both runs at 8 ranks. Nothing here should be much different on another Apple Silicon machine, since the arithmetic is the same.
+The reference numbers below are from an RTX 5080 with both runs at 8 ranks, with the M3 Max figures for the same deck beside them. Nothing here should be much different on any other card, since the arithmetic is the same on all of them; that the two columns agree to within a couple of percent, on a quantity that is a round-off difference amplified by the SASE gain, is the evidence for that.
 
 ```
-amplitudes, relative                         error       scale
-  Field/Global/intensity-farfield       6.614e-04   3.447e+20
-  Field/intensity-farfield              6.533e-04   1.768e+21
-  Field/ydivergence                     6.055e-04   1.599e-05
-  Field/xdivergence                     4.219e-04   1.590e-05
-  Field/intensity-nearfield             3.950e-04   1.104e+16
-  Beam/bunching                         1.927e-04   1.241e-02
-  Field/power                           1.448e-04   1.338e+07
-  Field/xsize                           4.592e-05   7.737e-05
-  worst of 51: 6.614e-04
+amplitudes, relative                         error       scale        Metal
+  Field/Global/intensity-farfield       6.722e-04   3.447e+20     6.614e-04
+  Field/intensity-farfield              6.557e-04   1.768e+21     6.533e-04
+  Field/ydivergence                     6.055e-04   1.599e-05     6.055e-04
+  Field/xdivergence                     4.219e-04   1.590e-05     4.219e-04
+  Field/intensity-nearfield             3.683e-04   1.104e+16     3.950e-04
+  Beam/bunching                         1.922e-04   1.241e-02     1.927e-04
+  Field/power                           1.472e-04   1.338e+07     1.448e-04
+  Field/xsize                           4.336e-05   7.737e-05     4.592e-05
+  worst of 51: 6.722e-04                                          6.614e-04
 ```
 
 Three things make a raw dataset-by-dataset comparison misleading, and `compare.py` separates them for that reason.
@@ -318,31 +369,47 @@ The physical comparison is the more useful one, and the wakefield case was measu
 
 ## Performance notes
 
-End-to-end wall clock of `sase_cpu.in` and `sase_gpu.in`, which are 500 slices at `ngrid = 256` over 196 steps with diagnostics at every step, on an M3 Max with 12 performance cores, 4 efficiency cores, a 40-core GPU and 128 GB.
+End-to-end wall clock of `sase_cpu.in` and `sase_gpu.in`, which are 500 slices at `ngrid = 256` over 196 steps with diagnostics at every step.
 
-| ranks | `sase_cpu.in` | `sase_gpu.in` |
-|---:|---:|---:|
-| 1 | 309.1 s | 5.2 s |
-| 2 | 158.5 s | 4.8 s |
-| 4 | 82.1 s | 4.6 s |
-| 12 | 35.2 s | 4.4 s |
+| ranks | RTX 5080, CPU | RTX 5080, GPU | M3 Max, CPU | M3 Max, GPU |
+|---:|---:|---:|---:|---:|
+| 1 | 268.0 s | 3.6 s | 309.1 s | 5.2 s |
+| 8 | 35.8 s | 2.2 s | | |
+| 12 | | | 35.2 s | 4.4 s |
+| 16 | 25.6 s | | | |
 
-About a second of each of those is setup, loading and the output file, on both paths. The tracking loop itself is 4.1 s on the GPU and about 34 s on twelve CPU ranks, so the GPU is worth roughly eight times all twelve cores and seventy-five times one of them, and it leaves the cores free while it works.
+The NVIDIA column is a Core Ultra 9 285K with 24 cores and an RTX 5080; the Apple one is an M3 Max with 12 performance cores, 4 efficiency cores and a 40-core GPU. About one to two seconds of every figure is setup, loading and the output file, on both paths. On the tracking loop alone the RTX 5080 takes 1.42 s against about 24 s for sixteen CPU cores and about 266 s for one, so the card is worth roughly seventeen times all sixteen cores and 190 times one of them, and it leaves the cores free while it works.
 
-Measure with a clock rather than with `clock()`. Genesis' `Total Wall Clock Time` was processor time until recently, which is the same thing for a CPU run that never waits and badly wrong for a GPU run that does: this deck reported 1.2 s while actually taking 5.2 s, because waiting costs no processor time and the shader compile happens in another process. That line is now genuine wall clock. Earlier versions of this chapter quoted the old figures and overstated the GPU by about a factor of four.
+Between the two GPUs the tracking loop is 1.42 s against 4.10 s, a factor of 2.9. The manual's own prediction, made before the CUDA backend existed and derived only from the memory bandwidth of the two devices, was 1.7 s. The transform is memory bound, so bandwidth is the first-order predictor and it got the sign and the order right; the remaining factor is that the RTX 5080 has more shared memory per block than Metal's 32 KB and the blocking was retuned for it.
 
-More MPI ranks against the one GPU achieve nothing. The tracking loop takes 4.1 s at one rank and 4.1 s at twelve, and the report at the end of the run says why: at one rank the device is already 92% busy, so there is nothing left to overlap and the extra ranks only divide up work they then queue for. Use one rank for a GPU run unless the deck needs the memory of several nodes.
+The grid-size scaling on the RTX 5080, same deck at one rank:
 
-Of the 4.1 s, 37% is the per-slice diagnostics, which `output_step = 100` reduces from 4.04 s to 2.53 s, 6% is the source deposition, and the rest is the four FFT passes, the Runge-Kutta push and the transverse map. The field solve runs close to the memory bandwidth of the machine, so the diagnostics are where the remaining headroom is, and `output_step` is the knob that costs nothing to turn. Most of the diagnostic cost is the far-field branch, which transforms every slice a second time.
+| `ngrid` | REGS x LANES | tracking loop | vs M3 Max |
+|---:|---:|---:|---:|
+| 64 | 8 x 8 | 0.36 s | 2.6x |
+| 128 | 16 x 8 | 0.50 s | 3.2x |
+| 256 | 16 x 16 | 1.40 s | 2.9x |
+| 512 | 32 x 16 | 4.80 s | 3.3x |
+| 1024 | 32 x 32 | 19.2 s | 3.5x |
 
-A small deck is a different problem, and used to be a bad one. The 500-slice example performs 19 ms of real work per step, so what it costs to hand work to the device does not matter. A steady-state deck is a single slice and a few tens of microseconds of arithmetic, and there the handover was everything: the engine now encodes a whole step into one command buffer and submits once, where it previously submitted four times and waited four times.
+Each row has four times the grid points of the row above it and costs between three and four times as much, which is what a memory-bound transform should do; the smaller grids cost less than that only because they do not fill the machine.
 
-| 1104-step steady-state deck | before | after |
-|---|---:|---:|
-| tracking loop | 3.91 s | 1.08 s |
-| device busy | 2.62 s | 0.54 s |
+Measure with a clock rather than with `clock()`. Genesis' `Total Wall Clock Time` was processor time until recently, which is the same thing for a CPU run that never waits and badly wrong for a GPU run that does: this deck reported 1.2 s while actually taking 5.2 s, because waiting costs no processor time. That line is now genuine wall clock. Earlier versions of this chapter quoted the old figures and overstated the GPU by about a factor of four.
 
-The same deck takes 3.75 s on one CPU core, so a steady-state run went from marginally slower than the CPU to three times faster. That the device busy time fell by as much as the wall clock is the point: most of what Metal was attributing to the device was the cost of starting work rather than of doing it. The remaining floor is about 1 ms per step, half of it device time for the fifteen or so dispatches a step encodes, so the next thing to try for small decks is fewer dispatches rather than faster ones.
+Read the busy percentage as a saturation indicator rather than as a calibrated fraction. It comes from device timestamps and the wall clock from the host, and the two clocks need not agree to better than a few percent; on the WSL2 machine these figures were taken on, a saturated run reports between 100% and 106%. What the number is for is the difference between 95% and 50%, not between 95% and 100%.
+
+More MPI ranks against one GPU achieve nothing on this deck. The tracking loop takes 1.42 s at one rank and 1.38 s at four, and the report at the end of the run says why: at one rank the device is already saturated, so the extra ranks only divide up work they then queue for. Use one rank per GPU unless the deck needs the memory of several, or unless the busy figure says the host is the limit; [running on more than one GPU](#running-on-more-than-one-gpu) covers both cases.
+
+Where the 4.1 s of the Metal loop goes, and the shape is the same on CUDA: 37% is the per-slice diagnostics, which `output_step = 100` reduces from 4.04 s to 2.53 s, 6% is the source deposition, and the rest is the four FFT passes, the Runge-Kutta push and the transverse map. The field solve runs close to the memory bandwidth of the machine, so the diagnostics are where the remaining headroom is, and `output_step` is the knob that costs nothing to turn. Most of the diagnostic cost is the far-field branch, which transforms every slice a second time.
+
+A small deck is a different problem, and used to be a bad one. The 500-slice example performs 19 ms of real work per step, so what it costs to hand work to the device does not matter. A steady-state deck is a single slice and a few tens of microseconds of arithmetic, and there the handover is everything. Metal fixed this by encoding a whole step into one command buffer and submitting once, where it previously submitted and waited four times; CUDA never had the problem, because launches on a stream are asynchronous and the whole step is queued before anything is waited on.
+
+| 1104-step steady-state deck | Metal, one submission per pass | Metal, one per step | CUDA |
+|---|---:|---:|---:|
+| tracking loop | 3.91 s | 1.08 s | 0.73 s |
+| device busy | 2.62 s | 0.54 s | 0.55 s |
+
+The same deck takes 3.70 s on one core of the 285K and 3.75 s on one of the M3 Max, so a steady-state run is five times faster on the GPU rather than marginally slower. That the Metal device busy time fell by as much as its wall clock, and that CUDA's busy time matches the improved Metal figure while its wall clock is lower still, says the same thing twice: most of what was being attributed to the device was the cost of starting work rather than of doing it. The remaining floor is a few hundred microseconds per step for the fifteen or so launches a step makes, so the next thing to try for small decks is fewer launches rather than faster ones.
 
 A step the backend refuses would cost more than it looks, because the particles and the field would have to come back to the host before it and go out again afterwards, making that step slower than the same step on the CPU alone. Correctors used to be refused, and since `orbiterror = true` is implemented as a corrector at every step, an orbit-error deck spent 187 of its 196 steps that way and lost about two thirds of the benefit of the GPU. Nothing falls back today.
 
@@ -357,21 +424,54 @@ The second row is the one that matters, since eight ranks waiting on each other 
 
 Startup is not free but it is not the problem either. The Metal shaders are compiled from source when the first `&track` block starts, in another process, and the cost does not scale with the problem. On this deck the whole fixed cost of a GPU run, covering loading, the shader compile and the output file, is about 1 s against about 0.9 s for the CPU path, whose own fixed cost is mostly FFTW planning its transforms. Neither is worth optimising unless the tracking loop is shorter than either.
 
+## Running on more than one GPU
+
+Genesis parallelises over slices with MPI and each rank constructs its own engine and owns its own slices, so a job spread over several cards is the arrangement that already exists with a different device attached to each rank. Nothing in `GPUEngine` or in the tracking loop assumes there is only one device, and nothing in a deck has to change.
+
+### How the device is chosen
+
+The CUDA backend picks its device from the rank's position within its node, not from its rank in the job. It splits `MPI_COMM_WORLD` with `MPI_Comm_split_type` and `MPI_COMM_TYPE_SHARED`, takes the rank within that communicator, and selects `local_rank % devices_visible`. Using the global rank instead would put every rank of a four-node job on device 0 of its node and leave three quarters of the hardware idle, which produces a correct answer at a quarter of the speed and is invisible unless someone looks — so the line printed at the start of a `&track` block says what happened.
+
+```
+CUDA backend: NVIDIA A100-SXM4-40GB (rank 0 of 8 on this node -> cuda:0 of 4,
+    2 ranks per device), 5310 MB resident, gamma_ref = 11357.8
+```
+
+Only rank 0 prints, so the line reports its own device and the shape of the whole node's mapping rather than a list. A run on a single card with a single rank prints just the device name.
+
+Two overrides exist. `CUDA_VISIBLE_DEVICES` is handled by the CUDA runtime and needs nothing from Genesis, since it simply changes what the backend can see; this is the right tool when a scheduler has already assigned cards. `G4_CUDA_DEVICE` sets the device for one process outright and is for a launcher that pins ranks itself. Both are reported in the line above when they take effect.
+
+### How many ranks per GPU
+
+One rank per GPU is the right default, because a single rank already saturates the device. On the 500-slice example on an RTX 5080 the tracking loop takes 1.42 s at one rank and 1.38 s at four, all pointed at the same card.
+
+The exception is a deck whose host-side work is significant, and the report line identifies it: a device busy percentage well below 100% means the host, not the device, is setting the pace. Incoherent radiation with `doSpread` is that case in both backends, since the draws are taken on the host to keep the noise realisation identical to the CPU's. Oversubscribing ranks divides the host work and leaves the device work where it was, so it helps that deck and does nothing for one that is already device-bound. Choose the rank count from the busy percentage rather than from the core count.
+
+### What splitting the job buys and costs
+
+Splitting across GPUs splits the memory, since each rank holds only the slices it owns, and on cards with modest memory that is the more important consequence. The 500-slice example needs 612 MB as one rank and 153 MB as four. Scaled up, a deck at `ngrid = 1024` with four harmonics needs about 21 GB of field and scratch, which does not fit on a 16 GB RTX 5080 or a 24 GB L4 as one rank but fits comfortably as four, on one card or on several. A deck that does not fit is refused with what it wanted and what was free, rather than failing inside an allocation.
+
+The scaling is not free. The slippage exchanges one field slice per step between neighbouring ranks, which on a single device is a pull and a push through the host and between devices becomes a host round trip on each side unless the MPI is CUDA-aware. At `ngrid = 256` that slice is 512 KB. The wakefield and the long-range space charge additionally perform an `MPI_Allgather` over all slices at every step, which is host-side work that does not shrink as ranks are added and which sets a floor for those decks. And as ranks multiply the work per rank falls: 500 slices across sixteen cards is 31 slices each, against launch and synchronisation overheads of the order of 0.1 ms per step. Expect the useful limit to arrive well before the arithmetic says it should, and measure rather than extrapolate.
+
+One caution when comparing runs across configurations: Genesis pads the slice count to a multiple of the rank count and distributes the slices accordingly, so the shot-noise realisation depends on the rank count. A four-rank run and a sixteen-rank run of the same deck are different noise seeds, and the difference between them is much larger than anything the GPU contributes. Compare like with like.
+
 ## Where the code lives
 
-Six files, of which two are the Apple backend.
+Eight files, of which two are the Apple backend and three the NVIDIA one.
 
 | | |
 |---|---|
 | `include/GPUEngine.h` | the interface the tracking loop talks to, and the design constraints any backend has to respect |
 | `src/Core/GPUEngine.cpp` | which backend is compiled in and how it is created; one branch per backend |
+| `include/CudaEngine.h`, `src/Core/CudaEngine.cu` | the NVIDIA backend: the kernels and the host code that drives them |
+| `src/Core/CudaFFT.cuh` | the transform, in a header so that `tools/fftcheck.cu` exercises the same code the field solve does |
 | `include/MetalEngine.h`, `src/Core/MetalEngine.mm` | the Apple Silicon backend: the Metal shaders and the host code that drives them |
 | `include/SliceMoments.h` | the per-slice diagnostic moments, in the normalisation `DiagBeam` and `DiagField` expect |
 | `src/Core/Gencore.cpp` | the tracking loop, which contains no device-specific code and no preprocessor conditionals |
 
-`Gencore.cpp` is worth reading against the interface rather than against Metal. It holds a `GPUEngine *` and has no `#ifdef` in it: the device-specific half of every decision is inside the backend, and the loop's half is only ever whether the host needs the data now.
+`Gencore.cpp` is worth reading against the interface rather than against either backend. It holds a `GPUEngine *` and has no `#ifdef` in it: the device-specific half of every decision is inside the backend, and the loop's half is only ever whether the host needs the data now. Adding CUDA changed four lines of `GPUEngine.cpp` and nothing at all in the tracking loop or in the physics classes.
 
-The comments at the head of `MetalEngine.mm` record the mistakes that have already been made once. The parameter structs are written twice, once in the shader string and once in host C++ immediately below it, so editing one alone skews the buffer layout silently and produces plausible but wrong physics. Dispatch geometry has to be parameterised at every dispatch site, because hard-coding it at one site only breaks at grid sizes other than the one being developed against. And the order of operations within a step has to mirror `Beam::track` exactly, down to the corrector kick landing before the longitudinal momentum factor is formed and only on the closing half step.
+The comments at the head of both backends record the mistakes that have already been made once. The order of operations within a step has to mirror `Beam::track` exactly, down to the corrector kick landing before the longitudinal momentum factor is formed and only on the closing half step. Dispatch geometry has to be parameterised at every dispatch site, because hard-coding it at one site only breaks at grid sizes other than the one being developed against. And in Metal the parameter structs are written twice, once in the shader string and once in host C++ immediately below it, so editing one alone skews the buffer layout silently and produces plausible but wrong physics; that particular hazard does not exist in CUDA, where host and device share the declaration.
 
 ## Porting to another GPU
 
@@ -391,11 +491,13 @@ The diagnostics have to be reduced on the device as well. They are not a small s
 
 Unsupported physics must be refused by name rather than worked around. A run that completes and writes a plausible output file having quietly dropped an effect the deck asked for is the worst failure mode available here, and it is what the hard errors and the sweep's treatment of an unexpected CPU fallback exist to prevent.
 
-Single precision has to be arranged for rather than merely accepted, if the backend uses it. Two reformulations in `MetalEngine.mm` are the ones to copy: gamma is carried as an offset from a reference energy, because at gamma = 11357 the single-precision quantum of absolute gamma is 1.35e-3 and the per-step energy change is 3.0e-4 at saturation, so storing absolute gamma gives errors between 65% and 276%; and the longitudinal momentum is formed as `gamma*sqrt(1-r)` rather than `sqrt(gamma^2-1-aw^2-p^2)`, since the single-precision quantum of gamma squared is about 15 and the subtraction loses the whole transverse contribution.
+Single precision has to be arranged for rather than merely accepted, if the backend uses it. Two reformulations are the ones to copy: gamma is carried as an offset from a reference energy, because at gamma = 11357 the single-precision quantum of absolute gamma is 1.35e-3 and the per-step energy change is 3.0e-4 at saturation, so storing absolute gamma gives errors between 65% and 276%; and the longitudinal momentum is formed as `gamma*sqrt(1-r)` rather than `sqrt(gamma^2-1-aw^2-p^2)`, since the single-precision quantum of gamma squared is about 15 and the subtraction loses the whole transverse contribution.
 
-### What is different about a discrete NVIDIA card
+### What the discrete card changed
 
-The largest difference is that the memory is not unified. This backend allocates every buffer as shared storage and the host reads and writes it directly, which is why the round trips described above are cheap enough to be acceptable. On a discrete card each of them becomes a transfer across PCIe, and they are worth listing because they happen every step.
+The CUDA backend is the second one and is worth reading as the answer to "how much of this was Apple specific?". The answer is: the memory model, and nothing else. Every kernel is a transcription, the transform shapes are the same, and the two backends agree with the CPU to the same figures. What the port actually consisted of is below, and a third backend should expect the same division.
+
+The memory is not unified, so every buffer is a device allocation with a pinned host staging area beside it. Metal reads and writes its buffers directly, which is why the round trips are cheap enough there to be unremarkable; on a discrete card each becomes a PCIe transfer and a synchronisation. They happen every step and are worth listing.
 
 | round trip | size per step | when |
 |---|---|---|
@@ -403,41 +505,29 @@ The largest difference is that the memory is not unified. This backend allocates
 | space-charge analysis | three floats per slice down, one float per slice up | both directions, only with short-range space charge |
 | space-charge diagnostic | one float per slice | device to host, only with short-range space charge |
 | wakefield loss | one float per slice | host to device, only with `&wake` |
+| long-range space charge | one float per slice | host to device, every step |
 | slippage | one field slice, `ngrid^2` complex, 512 KB at `ngrid = 256` | both directions, once per slip event in a time-dependent run |
 
-None of these is large in itself, but each is a synchronisation point, and on a discrete card a synchronisation costs more than the transfer does. The measurement that decides the design is worth repeating on the target machine before optimising anything: the report line at the end of a `&track` block gives the wall clock of the loop and the device busy time, and if the second is much smaller than the first then the host, the transfers or the launches are the limit rather than the arithmetic.
+None is large, but each is an ordering constraint, and the rule that keeps them correct is the one Metal already needed for a different reason: nothing the host writes may be overwritten while an operation that reads it is still queued. `beamStep` therefore drains the stream once, at the top, before it writes anything, and everything the host has to compute for a step is done before the first thing is queued.
 
-For scale, the tracking loop of the 500-slice benchmark moves 6.0 GB per step and achieves 287 GB/s on this machine, which is 72% of its 400 GB/s peak. Since the loop is memory-bound rather than arithmetic-bound, the memory bandwidth of the target is the first-order predictor of what it will do, and a card with less bandwidth than an Apple laptop will be slower than one however many teraflops it advertises. Scaling that measurement at the same efficiency suggests about 1.7 s on a card with 960 GB/s, 5.5 s on one with 300 GB/s and 1.1 s on one with 1555 GB/s, against the 4.1 s measured here. Treat those as estimates with a wide margin: the transform was shaped around Metal's 32 KB of threadgroup memory, and a device offering more could do better.
+Two host reads that Metal gets for nothing had to be moved into kernels. The on-axis field cell, which `DiagField` needs for `intensity-nearfield`, was one strided read per slice out of the resident field; the near-field reduction now writes it into its own output, since it is already touching the slice. And the whole-state transfers convert between the host's FP64 arrays and the device's FP32 ones through a pinned buffer holding a run of slices, because doing it a slice at a time costs a synchronisation per slice and `gpu_validate` does the whole state at every step.
 
-Double precision is available on NVIDIA hardware, and that changes what is worth doing. On a datacentre card it runs at half the single-precision rate and would give agreement with the CPU limited only by the order of operations, which would make `gpu_validate` a much sharper instrument; on a consumer card it runs at a thirty-second or a sixty-fourth of the rate and is not worth having. A backend could reasonably offer both and let the deck choose. Note that the interface already exposes `gammaRef`, which a double-precision backend does not need but costs nothing to keep.
+The rest was subtraction rather than addition. Metal has no threadgroup `atomic_float`, so the source deposition and the space-charge accumulation use a compare-and-swap loop on the bit pattern; CUDA has `atomicAdd` on a shared float, and two scratch arrays in the space-charge solve went away with it. Metal compiles its shaders from source when the first `&track` block starts, with the grid size and transform shape injected as preprocessor macros; in CUDA those are template parameters, every supported size is instantiated at build time, and the startup cost is gone. A threadgroup is a block, threadgroup memory is shared memory, a SIMD group is a warp, `simd_sum` is a warp shuffle and `threadgroup_barrier` is `__syncthreads`.
 
-`cuFFT` exists and the hand-written transform does not have to be reproduced. Three things about the field solve are fused into the transform passes here and would have to be handled either with callbacks or as separate elementwise kernels: the `expK` multiply on the inverse row pass, the source addition on the inverse column pass, and, when the source filter is on, the filter multiply on the forward column pass of the source. Whether that is faster than a hand-written kernel is a question for measurement; on this hardware the four-pass fused form runs at close to the memory bandwidth of the machine.
+One limit stopped being a constant. The radial grid of the space-charge solve is bounded by the shared memory of one block, which Metal fixes at 32 KB and which on NVIDIA is a device property: 48 KB without opting in, 100 KB on an L4 or a consumer Blackwell part, 164 KB on an A100. The backend reads it from the device, sizes the allocation dynamically, opts in above 48 KB, and names the actual limit when it refuses.
 
-The remaining mapping is mechanical. A threadgroup is a block and threadgroup memory is shared memory; a SIMD group is a warp, and the `simd_sum` reductions in the diagnostics become warp shuffles or `cub::BlockReduce`. `threadgroup_barrier` is `__syncthreads`. One point of friction disappears: Metal has `atomic_float` in the device address space only, so the source deposition and the space-charge accumulation use a compare-and-swap loop on the bit pattern in shared memory, whereas CUDA has `atomicAdd` for floats in shared memory directly. The shaders are compiled from source at startup here, with the grid size and the transform shape injected as preprocessor macros, which on CUDA would more naturally be template parameters instantiated at build time; that also removes the startup cost.
+`cuFFT` exists and the hand-written transform did not have to be reproduced; it was, because three things are fused into the passes here — the `expK` multiply on the inverse row pass, the source addition on the inverse column pass, and the filter multiply on the forward column pass of the source — and each would otherwise become a separate elementwise kernel reading and writing the whole field again. On this hardware the fused four-pass form runs at close to the memory bandwidth of the machine, so there was nothing to gain.
 
-### More than one GPU
+### Double precision on NVIDIA
 
-Genesis parallelises over slices with MPI, and each rank constructs its own engine and owns its own slices, so a job spread over several GPUs is the arrangement that already exists with a different device attached to each rank. Nothing in `GPUEngine` or in the tracking loop assumes there is only one device. This has never been exercised here, because the machine this backend was written on has a single GPU, but it is the configuration most clusters actually offer: four cards in a node, or a pool of cards across several nodes.
+Double precision is available on NVIDIA hardware, which changes what is worth doing, and the answer depends on the card. On an A100 it runs at half the single-precision rate and would give agreement with the CPU limited only by the order of operations, which would make `gpu_validate` a much sharper instrument. On an L4 or an RTX 5080 it runs at a sixty-fourth of the rate and is not worth having.
 
-What a backend has to add is device selection, and it has to come from the rank's position within its node rather than from its rank in the job. Split the communicator with `MPI_Comm_split_type` and `MPI_COMM_TYPE_SHARED`, take the rank within that, and select `local_rank % devices_visible`. Using the global rank instead puts every rank of a four-node job on device 0 of its node and leaves three quarters of the hardware idle, which is easy to do and produces a correct answer at a quarter of the speed.
-
-One rank per GPU is the right default, because a single rank already saturates the device: on this machine the tracking loop takes 4.1 s at one rank and 4.1 s at twelve, all pointed at the same GPU. The exception is a deck whose host-side work is significant, and the report line identifies it — a device busy percentage well below 100% means the host, not the device, is setting the pace. Incoherent radiation with `doSpread` is the case in this backend, since the draws are taken on the host:
-
-| 500-slice deck, one GPU | 1 rank | 2 ranks | 4 ranks |
-|---|---:|---:|---:|
-| with `doSpread` | 4.94 s, 71% busy | 4.37 s, 72% busy | 4.15 s, 52% busy |
-| without | 3.60 s, 95% busy | | 3.71 s, 52% busy |
-
-Oversubscribing ranks divides the host work and leaves the device work where it was, so it helps the first deck by 16% and very slightly hurts the second. Choose the rank count from the busy percentage rather than from the core count.
-
-Splitting a job across GPUs also splits the memory, since each rank holds only the slices it owns. That is the more important consequence on cards with modest memory: a deck at `ngrid = 1024` with four harmonics needs about 21 GB of field and scratch, which does not fit on a 24 GB card as one rank but fits comfortably as four.
-
-The scaling is not free. The slippage exchanges one field slice per step between neighbouring ranks, which on a single device is a pull and a push through the host and between devices becomes a host round trip on each side unless the MPI is CUDA-aware, in which case it can go device to device. At `ngrid = 256` that slice is 1 MB. The wakefield and the long-range space charge additionally perform an `MPI_Allgather` over all slices at every step, which is host-side work that does not shrink as ranks are added and which sets a floor for those decks. And as ranks multiply the work per rank falls: 500 slices across sixteen cards is 31 slices each, about 1.8 ms of device work per step, against launch and synchronisation overheads of the order of 0.1 ms. Expect the useful limit to arrive well before the arithmetic says it should, and measure rather than extrapolate.
-
-One caution when comparing runs across configurations: Genesis pads the slice count to a multiple of the rank count and distributes the slices accordingly, so the shot-noise realisation depends on the rank count. A four-rank run and a sixteen-rank run of the same deck are different noise seeds, and the difference between them is much larger than anything the GPU contributes. Compare like with like.
+This backend is single precision on all of them. A double-precision variant would be a second engine rather than a flag on this one, because the FP32 reformulations above are woven through every kernel: `gammaRef` would be unnecessary, the detuning would be the literal expression rather than its series, and `gamma*beta_z` could be formed the way the CPU forms it. The interface already exposes `gammaRef`, which such a backend does not need but costs nothing to keep.
 
 ### Validating a new backend
 
-Use the same instruments. `gpu_validate = true` runs both paths from the same state at every step and reports the largest relative difference, which is what makes a wrong kernel show up as an unmistakable jump rather than as chaotic growth; `sweep.py` drives that across the whole matrix and needs only `--genesis` pointed at the new binary. The sweep is not Apple specific and nothing in it assumes Metal.
+Use the same instruments. `gpu_validate = true` runs both paths from the same state at every step and reports the largest relative difference, which is what makes a wrong kernel show up as an unmistakable jump rather than as chaotic growth; `sweep.py` drives that across the whole matrix and needs only `--genesis` pointed at the new binary. Nothing in the sweep is specific to a backend, and porting it to CUDA needed two changes, both of which were the sweep being too specific rather than the backend misbehaving: one case matched on Metal's word for shared memory, and one asked for a radial grid that Metal cannot hold but a 100 KB card can.
+
+Three habits are worth adopting from these ports. When a comparison looks catastrophic, check whether the quantity being compared is meaningfully non-zero before believing it: the `SSCfield` case above spent a while looking like a 14% error when both numbers were zero to within their own arithmetic. When a before-and-after measurement comes out as exactly zero, suspect the measurement: building a reference binary with `git checkout` rather than a separate worktree carries staged changes across and silently compares a binary with itself. And when a case fails on the new machine and passed on the old one, find out which of the two was lucky before assuming it was the port: the five wakefield cases failed on Linux because `&wake` in a steady-state run read one past the end of a one-element vector, which the macOS allocator had been answering with a number that happened to work.
 
 Two habits are worth adopting from this port. When a comparison looks catastrophic, check whether the quantity being compared is meaningfully non-zero before believing it: the `SSCfield` case above spent a while looking like a 14% error when both numbers were zero to within their own arithmetic. And when a before-and-after measurement comes out as exactly zero, suspect the measurement: building a reference binary with `git checkout` rather than a separate worktree carries staged changes across and silently compares a binary with itself.

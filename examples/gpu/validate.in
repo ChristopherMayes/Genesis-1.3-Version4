@@ -12,7 +12,11 @@
 #
 # Expect, at the end of the run:
 #
-#   Metal vs CPU over 1104 steps: max relative error, field 2.3e-04, beam 3.3e-06
+#   CUDA vs CPU over 1104 steps: max relative error, field 2.1e-04, beam 3.2e-06
+#
+# The backend names itself in that line, so a Metal build reports the same
+# thing under its own name and to within a couple of percent of the same
+# numbers.
 #
 # Both numbers are the FP32 round-off level. Anything above ~1e-3 means the GPU
 # path is wrong on this machine, not merely less precise.

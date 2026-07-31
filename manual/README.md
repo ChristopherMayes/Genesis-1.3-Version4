@@ -5,4 +5,4 @@
 
 [Lattice File](LATTICE.md)
 
-[GPU Acceleration on Apple Silicon](GPU.md)
+[GPU Acceleration](GPU.md)

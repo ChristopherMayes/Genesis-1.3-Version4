@@ -79,14 +79,16 @@ results for anyone currently setting the flag.
 | `wip/fp32-precision` | `8f456e6` | local only, parked |
 | `tmp/merge-check` | `56781b4` | local scratch, safe to delete |
 
-## 2. GPU work (Apple Silicon / Metal, FP32)
+## 2. GPU work (Metal and CUDA, FP32)
 
 Prototypes are preserved in `~/Code/genesis4-gpu-proto/`.
 
 Work happens on branch `gpu/metal-engine`. Build with
-`cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DENABLE_METAL=ON`
-and switch on per `&track` block with `gpu = true` (plus `gpu_validate = true` to run the CPU
-path alongside and report the difference).
+`cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DENABLE_CUDA=ON`
+on an NVIDIA machine, or the `-DENABLE_METAL=ON` / `build-metal` equivalent on a Mac, and
+switch on per `&track` block with `gpu = true` (plus `gpu_validate = true` to run the CPU
+path alongside and report the difference). The CUDA environment is `genesis4-cuda`, which
+adds `cuda-nvcc cuda-cudart-dev cuda-version=13.2` to the usual four dependencies.
 
 - [x] Metal FFT field solver — radix-16, **14.4 µs/slice-step, 365 GB/s (91% of peak)**
 - [x] Engine scaffolding, upload/download round trip, GPU field solve, GPU beam step
@@ -95,28 +97,43 @@ path alongside and report the difference).
       left in it, so a CUDA or HIP backend is a subclass plus one branch in
       `GPUEngine::create()`. `GPUEngine.h` records the constraints such a backend inherits.
 - [x] Namelist control (`gpu`, `gpu_validate`) and hard errors for unported physics
-- [x] **Validation matrix** — `examples/metal-gpu/sweep.py`, about 52 cases over undulator
+- [x] **Validation matrix** — `examples/gpu/sweep.py`, about 52 cases over undulator
       geometry, transport, lattice errors, grid size, harmonics, beam parameters, collective
       effects, time dependence and every refusal. It found four defects; see below.
 - [x] **GPU diagnostic reductions** — the diagnostics were 76% of the GPU runtime
 - [x] **Full residency** — no per-step marshalling; the host only sees the arrays at dumps,
       at the slippage boundary slice, and at the end of `&track`
+- [x] **CUDA backend** — `CudaEngine`, second implementation of the same interface, tested on
+      an RTX 5080 (sm_120) and built for A100 (80), L4 (89) and Blackwell (120) with PTX for
+      anything newer. The kernels are transcriptions of the Metal ones, so the two agree with
+      the CPU to the same figures; the port was the memory model and nothing else. All 72
+      sweep cases pass. **Tracking loop 1.42 s against the M3 Max's 4.10 s on the 500-slice
+      deck**, and 17x all sixteen CPU cores of the same machine.
+- [x] **Multi-GPU device selection** — `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED)`, then
+      `local_rank % devices_visible`, with `G4_CUDA_DEVICE` to override and the whole node's
+      mapping reported in the backend line. Not yet exercised on a machine with more than one
+      card; the selection and the reporting are, at 1, 2 and 4 ranks against one device.
 
-**Measured (500 slices, zstop=10, ngrid=256, 1 harmonic, output_step=1, M3 Max, 12
-performance cores, 40-core GPU). End-to-end wall clock:**
+**Measured (500 slices, zstop=10, ngrid=256, 1 harmonic, output_step=1). End-to-end wall
+clock, on a Core Ultra 9 285K with 24 cores and an RTX 5080, and on an M3 Max with 12
+performance cores and a 40-core GPU:**
 
-| config | wall | vs 1 CPU core | vs 12 CPU cores |
-|---|---|---|---|
-| CPU 1 rank | 309.1 s | 1× | — |
-| CPU 12 ranks | 35.2 s | 8.8× | 1× |
-| GPU 1 rank | **5.5 s** | **56×** | **6.4×** |
-| GPU 12 ranks (one GPU) | **4.4 s** | **70×** | **8.0×** |
+| config | 285K + RTX 5080 | M3 Max |
+|---|---|---|
+| CPU 1 rank | 268.0 s | 309.1 s |
+| CPU all cores | 25.6 s (16 ranks) | 35.2 s (12 ranks) |
+| GPU 1 rank | **3.6 s** | **5.2 s** |
+| GPU 8 / 12 ranks (one GPU) | **2.2 s** | **4.4 s** |
 
-About 1 s of every one of those is setup and output, on both paths, so on the tracking loop
-alone the GPU is 4.1 s against about 34 s for twelve ranks, i.e. **8×**.
+One to two seconds of every one of those is setup and output, on both paths, so on the
+tracking loop alone the RTX 5080 is 1.42 s against about 24 s for sixteen CPU ranks
+(**17×**) and about 266 s for one (**190×**). Against the M3 Max's 4.10 s it is **2.9×**,
+where the bandwidth ratio alone predicted 2.4× before the backend existed.
 
-Extra MPI ranks against the single GPU are worth **nothing**: the tracking loop is 4.1 s at
-one rank and 4.1 s at twelve, and the device is already 92% busy at one rank.
+Extra MPI ranks against a single GPU are worth **nothing**: the tracking loop is 1.42 s at
+one rank and 1.38 s at four, and the device is already saturated at one rank. Several
+*cards* are worth having, one rank each, and that is what the node-local device selection
+above is for.
 
 **Every GPU timing before this was overstated by about 4×.** Genesis' `Total Wall Clock
 Time` was `clock()`, i.e. processor time, which equals the wall clock for a CPU run that
@@ -130,7 +147,24 @@ Agreement with a rank-matched CPU reference: `Field/power` 1.6e-04, `Field/xsize
 
 ### What the validation sweep found
 
-Four defects, three of them in the GPU path and one upstream:
+Six defects across the two ports, three of them in the GPU path and three upstream. The last
+two are from the CUDA port and are both cases of a bug that macOS had been hiding:
+
+5. **`&wake` in a steady-state run read one past the end of a one-element vector.**
+   `Wake::init` took the slice separation as `s[1]-s[0]`, but `Time::getPosition` returns a
+   single slice when there is no `&time` namelist. On macOS the word after it happened to be
+   a usable number and the five wakefield sweep cases passed; on Linux it read equal to
+   `s[0]`, giving `ds = 0`, then a NaN slice index inside `Collective::update`, then an
+   `INT_MIN` cast and an out-of-range abort. Nothing to do with the GPU — the CPU-only path
+   aborts identically. Fixed in `Wake.cpp`: a lone slice is one reference length long.
+6. **The bunching factors and the auxiliary min/max output shared slots in the diagnostic
+   reduction.** Both backends laid the per-slice output out with bunching at slot `12+2h` and
+   the auxiliary extrema at 20, which collide for `bunchharm > 4`; the extrema are written
+   second, so harmonics five to eight were silently replaced. Found by reading the layout
+   while transcribing it, not by the sweep, which does not run `bunchharm = 8` and
+   `auxiliar` together. The stride is now 48 and the extrema start at 28, in both backends.
+
+And the original four:
 
 1. `&lattice` with a `seed` key aborts. See the fourth report above.
 2. `gpu_validate` silently discarded any step the GPU refused. The comparison measured the
@@ -156,7 +190,10 @@ Two lessons about the harness itself are worth keeping:
   tier's own measurement: the largest single-step difference times the number of steps is the
   most that round-off alone can produce, and every case stays under it. `run_corrector` is the
   closest at 1.3x the bound.
-- **A case that only fails on one machine is still a real failure.** On the M3 Max
+- **A case that only fails on one machine is still a real failure.** This came up twice.
+  The five wakefield cases above passed on the Mac and aborted on Linux, and the temptation
+  was to call it a CUDA regression; it was undefined behaviour that one allocator had been
+  answering conveniently. On the M3 Max
   `run_two_track_blocks` came out at 2.2x the bound, where the M1 Max had it at 1.3x. It was
   not the machine and not a regression — the same commit failed the same way — but a
   pre-existing upstream defect that the GPU makes unavoidable: the on-axis near-field
@@ -292,18 +329,26 @@ Two lessons about the harness itself are worth keeping:
       `npart` at large `ngrid`, seen from the other side. The strong case is the one worth
       keeping in the sweep: it changes `Field/xsize` by 25% while the paths differ by 1.5e-05.
 
-### Notes for the NVIDIA port
+### The NVIDIA port, predicted and measured
 
-Estimates for the three targets under consideration, scaled from the measured 6.0 GB moved per
-step and 287 GB/s achieved here (72% of this machine's 400 GB/s). The loop is memory bound, so
-bandwidth is the first-order predictor; treat these as +/- 30%.
+Estimates made before the backend existed, scaled from the measured 6.0 GB moved per step and
+287 GB/s achieved on the M3 Max (72% of its 400 GB/s), against what the RTX 5080 actually did.
+The loop is memory bound, so bandwidth is the first-order predictor, and it was a good one.
 
-| card | peak BW | estimated loop | vs M3 Max |
-|---|---:|---:|---:|
-| M3 Max 40-core | 400 GB/s | 4.1 s measured | 1.0x |
-| RTX 5080 | 960 GB/s | ~1.7 s | ~2.4x |
-| L4 | 300 GB/s | ~5.5 s | ~0.7x |
-| A100 40GB | 1555 GB/s | ~1.1 s | ~3.9x |
+| card | peak BW | estimated loop | measured | vs M3 Max |
+|---|---:|---:|---:|---:|
+| M3 Max 40-core | 400 GB/s | 4.1 s measured | 4.10 s | 1.0x |
+| RTX 5080 | 960 GB/s | ~1.7 s | **1.42 s** | **2.9x** |
+| L4 | 300 GB/s | ~5.5 s | not yet run | ~0.7x |
+| A100 40GB | 1555 GB/s | ~1.1 s | not yet run | ~3.9x |
+
+The 5080 came in 20% faster than the bandwidth estimate, which is what retuning the blocking
+for a card with 100 KB of shared memory per block rather than Metal's 32 KB is worth. Expect
+the same margin on the other two, so the L4 estimate is optimistic on the wrong side of 4.1 s
+and the A100 should land near 0.9 s. **Neither has been run.** The code is compiled for both
+(`sm_80` and `sm_89` are in the default `CUDA_ARCHS`) and nothing in it is specific to the
+5080 — the two device properties that vary, shared memory per block and total memory, are read
+from the device and reported rather than assumed — but that is an argument, not a measurement.
 
 **A single L4 is slower than this laptop**, having less bandwidth than Apple's unified memory,
 and no amount of FP32 throughput changes that for a bandwidth-bound loop. It is still the most
@@ -327,7 +372,10 @@ question, cuFFT, and the multi-GPU section covering device selection from the MP
 
 ### Constraints that must not be forgotten
 
-- Apple GPUs have **no FP64**. Metal has no `double`. FP32 is mandatory, not a choice.
+- Apple GPUs have **no FP64**. Metal has no `double`. FP32 is mandatory, not a choice. On
+  NVIDIA it is a choice: half rate on an A100, a sixty-fourth on an L4 or a 5080. A
+  double-precision engine would be worth writing for the A100 and would be a second engine,
+  not a flag, because the FP32 reformulations below are woven through every kernel.
 - **`gamma` must be stored as an offset from a reference energy.** At γ₀ = 11357 the FP32
   quantum of absolute γ is 1.35e-3, larger than the per-step energy change (3.0e-4 at
   saturation, 5.5e-7 at seed). Storing absolute γ in FP32 gives 65%–276% error.
@@ -335,8 +383,15 @@ question, cuFFT, and the multi-GPU section covering device selection from the MP
   GPU run must set `fft_fieldsolver = true` in `&track`. Easy footgun.
 - Metal has **no threadgroup `atomic_float`** — `atomic_float` exists in the device address
   space only. Threadgroup float accumulation needs `atomic_uint` + a CAS loop on the bit
-  pattern (cheap in local memory).
+  pattern (cheap in local memory). CUDA has `atomicAdd` on a shared float and does not.
 - The tiled deposition requires `ngrid % 32 == 0`, one more reason to prefer 256 over 255.
+- **On a discrete card, nothing the host writes may be overwritten while a copy that reads it
+  is still queued.** The pinned per-step arrays are reused every step, so `beamStep` drains
+  the stream once at the top before writing any of them, and does all its host-side work
+  before queueing anything. Metal needed the same rule for a different reason.
+- **The busy percentage is a saturation indicator, not a calibrated fraction.** Device
+  timestamps and the host clock need not agree to better than a few percent; on WSL2 a
+  saturated run reports 100–106%. It answers 95% against 50%, not 95% against 100%.
 
 ## 3. Housekeeping / possible upstream reports
 

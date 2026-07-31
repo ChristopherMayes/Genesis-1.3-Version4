@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Sweep the Metal GPU backend against the CPU across a matrix of deck options.
+"""Sweep the GPU backend against the CPU across a matrix of deck options.
 
     export FI_PROVIDER=tcp
-    python3 sweep.py --genesis ../../build-metal/genesis4
+    python3 sweep.py --genesis ../../build-cuda/genesis4     # or build-metal
+
+Nothing here is specific to a backend: the binary names its own in the lines
+that are parsed, and the cases are decks rather than kernels.
 
 Every case is generated from one base deck, so a failure names the single
 option that caused it.
@@ -311,10 +314,15 @@ case("sc_longrange",
      extra="&efield\nnz = 1\nnphi = 0\nngrid = 32\nlongrange = true\n&end\n")
 
 # -- physics the GPU does not implement, which must be refused --------------
+# The radial grid of the space-charge solve is bounded by the shared memory of
+# one block, which is a property of the device: 384 points on Metal's 32 KB and
+# 1584 on a card offering 100 KB. The size asked for here is past any of them,
+# and the phrase matched on is the part of the message that does not name the
+# vendor's word for that memory.
 case("refuse_spacecharge_grid",
-     extra="&efield\nnz = 1\nnphi = 0\nngrid = 512\n&end\n",
-     expect="error:threadgroup memory",
-     note="the radial arrays of the solve have to fit in threadgroup memory")
+     extra="&efield\nnz = 1\nnphi = 0\nngrid = 4096\n&end\n",
+     expect="error:holds the radial arrays in",
+     note="the radial arrays of the solve have to fit in the shared memory of a block")
 case("refuse_ngrid_odd", edit={"field.ngrid": 151},
      expect="error:Set ngrid = 128")
 case("refuse_ngrid_2048", edit={"field.ngrid": 2048},
@@ -433,7 +441,7 @@ def render(case, name, gpu):
 
 
 # The backend names itself in both lines, so these match whichever one the
-# binary was built with rather than Metal specifically.
+# binary was built with rather than any one of them.
 ERR_LINE = re.compile(
     r"\w+ vs CPU over (\d+) steps: max relative error, field (\S+), beam (\S+)")
 FALLBACK = re.compile(r"\w+: (\d+) of (\d+) steps fell back")
@@ -465,7 +473,7 @@ def compare(workdir, a, b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--genesis", default=os.path.join(HERE, "..", "..",
-                                                      "build-metal", "genesis4"))
+                                                      "build-cuda", "genesis4"))
     ap.add_argument("--mpirun", default=shutil.which("mpirun") or "mpirun")
     ap.add_argument("--workdir", default="/tmp/g4sweep")
     ap.add_argument("--only", default="", help="run only cases matching this regex")
