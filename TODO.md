@@ -31,6 +31,20 @@ one worth explaining: on a CPU-only build with `ngrid = 256`, `Field/intensity-n
 peaks at 3.0e15 W/m^2 where the power and spot size imply 1.2e18 on axis — a factor of 400
 low, because the sampled cell is at the edge of the grid. With the fix it reads 1.5e18.
 
+The fourth is [#279](https://github.com/svenreiche/Genesis-1.3-Version4/pull/279),
+`fix/wake-steady-state`, and is not a draft because there is no open design question in it.
+`Wake::init` took the slice separation as `s[1]-s[0]`, but `getPosition` returns one slice
+for a steady-state run, so that is a read one past the end of the vector. On macOS the next
+word held a usable number and the five wakefield cases in `sweep.py` passed; on Linux it
+holds a copy of `s[0]`, giving `ds = 0`, then `floor(0/0)` as a slice index inside
+`Collective::update`, an `INT_MIN` cast and an out-of-range abort. Nothing to do with the
+GPU — the CPU-only path aborts identically, and the line is untouched by the GPU branch.
+The case that settles fixing it rather than refusing a steady-state `&wake` is the external
+`loss` term, which needs no current profile and no convolution and aborts too. Verified
+against a bit-for-bit comparison of a 4000-slice time-dependent run: four far-field
+datasets move by one ulp, and the same two binaries move them identically on a deck with no
+`&wake` in it at all, so that is `FFTW_MEASURE` picking a different plan and not the change.
+
 The third draft is [#278](https://github.com/svenreiche/Genesis-1.3-Version4/pull/278),
 `fix/electron-rest-energy`. `eev` was 510999.06 eV and is now 510998.95069, the CODATA 2022
 value, and the places that open-coded it as the literal `511000` — `BeamSolver.cpp`,
@@ -396,7 +410,9 @@ question, cuFFT, and the multi-GPU section covering device selection from the MP
 ## 3. Housekeeping / possible upstream reports
 
 Two of these are now fixed on `gpu/metal-engine` and are worth their own branches off
-`master`, since neither has anything to do with the GPU:
+`master`, since neither has anything to do with the GPU. Both have since been sent; the
+steady-state `&wake` abort found during the CUDA port went the same way, as
+[#279](https://github.com/svenreiche/Genesis-1.3-Version4/pull/279).
 
 - **`Total Wall Clock Time` was `clock()`**, i.e. processor time, not wall clock. Identical
   for a CPU run that never waits; four times too small for one that waits on a device, and it
