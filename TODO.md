@@ -4,67 +4,52 @@
 
 ### Merged
 
-All four are in `svenreiche/Genesis-1.3-Version4` master as of `fc046e3`, and our fork's
-`master` is synced to it.
-
-| PR | branch | commit | title |
-|---|---|---|---|
-| [#272](https://github.com/svenreiche/Genesis-1.3-Version4/pull/272) | `fix/source-filter-noop` | `4fe13fe` | Fix `source_filter` being silently ignored in `FieldSolverFFT` |
-| [#273](https://github.com/svenreiche/Genesis-1.3-Version4/pull/273) | `perf/fft-two-pass` | `e101b30` | `FieldSolverFFT`: drop the source-term FFT when the source filter is off |
-| [#274](https://github.com/svenreiche/Genesis-1.3-Version4/pull/274) | `perf/user-diagnostic-guard` | `b815d7a` | Skip the user diagnostic's per-particle work when its output is disabled |
-| [#275](https://github.com/svenreiche/Genesis-1.3-Version4/pull/275) | `fix/lattice-seed-key` | `b997669` | Fix an uncaught exception when `&lattice` sets a seed |
-
-Two consequences for `gpu/metal-engine`, which is still based on v4.6.14: commit `4ef0989`
-duplicates `b997669` exactly, and `959012c` contains `b815d7a` plus changes of its own. A
-rebase onto the new master should drop the first and keep only the `Diagnostic.cpp` half of
-the second.
-
-### Sent, as drafts
+All eight are in `svenreiche/Genesis-1.3-Version4` master as of `5b34ee6`, and our fork's
+`master` is synced to it. Nothing is outstanding upstream.
 
 | PR | branch | title |
 |---|---|---|
+| [#272](https://github.com/svenreiche/Genesis-1.3-Version4/pull/272) | `fix/source-filter-noop` | Fix `source_filter` being silently ignored in `FieldSolverFFT` |
+| [#273](https://github.com/svenreiche/Genesis-1.3-Version4/pull/273) | `perf/fft-two-pass` | `FieldSolverFFT`: drop the source-term FFT when the source filter is off |
+| [#274](https://github.com/svenreiche/Genesis-1.3-Version4/pull/274) | `perf/user-diagnostic-guard` | Skip the user diagnostic's per-particle work when its output is disabled |
+| [#275](https://github.com/svenreiche/Genesis-1.3-Version4/pull/275) | `fix/lattice-seed-key` | Fix an uncaught exception when `&lattice` sets a seed |
 | [#276](https://github.com/svenreiche/Genesis-1.3-Version4/pull/276) | `fix/wallclock-timer` | Report the wall clock time rather than the processor time at the end of a run |
 | [#277](https://github.com/svenreiche/Genesis-1.3-Version4/pull/277) | `fix/onaxis-cell-even-ngrid` | Take the on-axis field diagnostic from the axis when `ngrid` is even |
+| [#278](https://github.com/svenreiche/Genesis-1.3-Version4/pull/278) | `fix/electron-rest-energy` | Take the electron rest energy from one constant, and from CODATA |
+| [#279](https://github.com/svenreiche/Genesis-1.3-Version4/pull/279) | `fix/wake-steady-state` | Take the wake slice separation from a slice that exists |
 
-Both are cherry-picked out of the GPU branch, build clean and are non-GPU. The second is the
-one worth explaining: on a CPU-only build with `ngrid = 256`, `Field/intensity-nearfield`
-peaks at 3.0e15 W/m^2 where the power and spot size imply 1.2e18 on axis — a factor of 400
-low, because the sampled cell is at the edge of the grid. With the fix it reads 1.5e18.
+Six of the eight were found by building the GPU validation matrix, or by having to read code
+closely enough while porting it to notice. That is the argument for a differential test
+against an existing implementation: it finds the existing implementation's bugs as readily as
+the new one's.
 
-The fourth is [#279](https://github.com/svenreiche/Genesis-1.3-Version4/pull/279),
-`fix/wake-steady-state`, and is not a draft because there is no open design question in it.
-`Wake::init` took the slice separation as `s[1]-s[0]`, but `getPosition` returns one slice
-for a steady-state run, so that is a read one past the end of the vector. On macOS the next
-word held a usable number and the five wakefield cases in `sweep.py` passed; on Linux it
-holds a copy of `s[0]`, giving `ds = 0`, then `floor(0/0)` as a slice index inside
-`Collective::update`, an `INT_MIN` cast and an out-of-range abort. Nothing to do with the
-GPU — the CPU-only path aborts identically, and the line is untouched by the GPU branch.
-The case that settles fixing it rather than refusing a steady-state `&wake` is the external
-`loss` term, which needs no current profile and no convolution and aborts too. Verified
-against a bit-for-bit comparison of a 4000-slice time-dependent run: four far-field
-datasets move by one ulp, and the same two binaries move them identically on a deck with no
-`&wake` in it at all, so that is `FFTW_MEASURE` picking a different plan and not the change.
+### What the two rebases did
 
-The third draft is [#278](https://github.com/svenreiche/Genesis-1.3-Version4/pull/278),
-`fix/electron-rest-energy`. `eev` was 510999.06 eV and is now 510998.95069, the CODATA 2022
-value, and the places that open-coded it as the literal `511000` — `BeamSolver.cpp`,
-`Collective.cpp`, `EFieldSolver.h`, and the backend, which is not part of the PR — now use
-the constant. The name stays `eev` rather than becoming something clearer such as `mec2`,
-because it is upstream's own name with 33 uses in 25 files, and renaming it would put a
-conflict in every one of them for no functional gain.
+`gpu/metal-engine` has now been rebased twice, onto `fc046e3` and onto `5b34ee6`, and both
+were verified content-preserving by diffing the rebased tree against the tree before it. Worth
+continuing to do, because the check is cheap and the failure mode is silent.
 
-The inconsistency removed is larger than the CODATA correction: the literal was 1.8e-06 away
-from the constant, the constant 2.1e-07 away from CODATA. Measured on the shipped
-`benchmark/Benchmark1-SASE` deck, master against the branch, the largest amplitude shifts are
-1.8e-05 in `Beam/bunching3`, 2.2e-06 in `Field/intensity-nearfield` and 6.6e-07 in
-`Field/power`; `Beam/bunchingphase3` moves by 2.0e-02 rad, this being a saturated run where
-the third harmonic is the most sensitive thing in the file. GPU and CPU agreement is
-unaffected, since both paths take the value from the same place, and all 62 sweep cases pass.
+The second rebase had four conflicts, all of them the same shape — upstream and the branch
+having edited the same line for different reasons:
 
-**Measuring a "before" build needs a worktree, not a checkout.** `git checkout master` with
-the change staged carries it across, so the first attempt built the new constant into both
-binaries and reported that every dataset was bit-identical. The check that caught it was
-searching each binary for the IEEE-754 pattern of the two values; worth repeating whenever a
+- `Diagnostic.cpp`: upstream now carries the on-axis index, the branch adds the
+  precomputed-moments branch to the same statement. Kept both.
+- `Collective.cpp`: upstream's `apply` assigns `beam->eloss`, the branch had already factored
+  that into `computeLoss`. Dropped the duplicate.
+- `Collective.h`: trailing whitespace. Took upstream's bytes so the file shows no diff.
+- `Wake.cpp`: the same fix with a longer comment on the branch. Took upstream's, leaving the
+  file identical to master. The diagnosis the shorter comment omits is recorded in section 2
+  below rather than lost.
+
+Two commits were left holding only the backend's half of a change whose shared half is now
+upstream — the Metal uses of the `511000` literal, and the backend's copy of the on-axis
+index. Both were reworded, since a commit titled after the upstream fix but containing two
+lines of Metal is worse than no message at all.
+
+**Measuring a "before" build needs a worktree, not a checkout.** `git checkout master` with a
+change staged carries it across, so the first attempt at the `eev` measurement built the new
+constant into both binaries and reported every dataset bit-identical. What caught it was
+searching each binary for the IEEE-754 patterns of the two values; worth repeating whenever a
 before-and-after claim comes out as exactly zero.
 
 ### Not worth sending
@@ -421,21 +406,24 @@ question, cuFFT, and the multi-GPU section covering device selection from the MP
 
 ## 3. Housekeeping / possible upstream reports
 
-Two of these are now fixed on `gpu/metal-engine` and are worth their own branches off
-`master`, since neither has anything to do with the GPU. Both have since been sent; the
-steady-state `&wake` abort found during the CUDA port went the same way, as
-[#279](https://github.com/svenreiche/Genesis-1.3-Version4/pull/279).
+The first three entries below have all been sent and merged — the wall-clock timer as #276,
+the on-axis cell as #277, and the steady-state `&wake` abort found during the CUDA port as
+#279 — and are kept here only as the record of what they were. What remains open is everything
+from the fourth entry down.
 
 - **`Total Wall Clock Time` was `clock()`**, i.e. processor time, not wall clock. Identical
   for a CPU run that never waits; four times too small for one that waits on a device, and it
   also ignores every rank but the zeroth. `GenMain.cpp` now uses `std::chrono::steady_clock`.
-- **The on-axis near-field diagnostic samples the wrong cell for an even `ngrid`.**
+  Merged as #276.
+- **The on-axis near-field diagnostic sampled the wrong cell for an even `ngrid`.**
   `(ngrid*ngrid-1)/2` is the axis only when `ngrid` is odd; for an even grid it is the last
   column of the row below the middle, i.e. the edge of the grid, where the field is orders of
-  magnitude smaller. `intensity-nearfield` and `phase-nearfield` are then reporting a corner of
-  the box. `(ngrid/2)*ngrid + ngrid/2` is identical for odd `ngrid` and right for even, and is
-  now used in `Diagnostic.cpp`, `Field.cpp` and the backend. Nobody noticed because the
-  traditional Genesis convention is an odd `ngrid`; the GPU only takes powers of two.
+  magnitude smaller. `intensity-nearfield` and `phase-nearfield` were then reporting a corner
+  of the box. `(ngrid/2)*ngrid + ngrid/2` is identical for odd `ngrid` and right for even.
+  Nobody noticed because the traditional Genesis convention is an odd `ngrid`; the GPU only
+  takes powers of two. Merged as #277.
+- **`&wake` in a steady-state run read one past the end of a one-element vector**, described
+  in full in section 2. Merged as #279.
 
 - `export FI_PROVIDER=tcp` is a libfabric knob, not a universal one. Conda's Linux MPICH is
   built `ch4:ucx,ofi` and prefers UCX, so it never reaches libfabric and the variable is inert;
