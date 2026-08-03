@@ -2,7 +2,7 @@
 
 Genesis 4 has an optional GPU backend for the tracking loop. It is opt-in at build time and again in each `&track` block, so a binary built with it behaves exactly as it did before unless a deck asks for it.
 
-There are two backends. `ENABLE_METAL` builds the Apple Silicon one, written against Metal; `ENABLE_CUDA` builds the NVIDIA one, written against CUDA and tested on an RTX 5080, an L4 and an A100. They implement the same interface, `GPUEngine`, and the tracking loop cannot tell them apart. The physics, the transform and the order of operations are the same code transcribed, so the two produce the same numbers; what differs between them is the memory model, and everything that follows from a discrete card having its own.
+There are two backends. `ENABLE_METAL` builds the Apple Silicon one, written against Metal; `ENABLE_CUDA` builds the NVIDIA one, written against CUDA, measured on an RTX 5080 and compiled for the L4 and the A100 as well. They implement the same interface, `GPUEngine`, and the tracking loop cannot tell them apart. The physics, the transform and the order of operations are the same code transcribed, so the two produce the same numbers; what differs between them is the memory model, and everything that follows from a discrete card having its own.
 
 Everything both backends do is in single precision. On Apple that is not a choice at all, since Apple GPUs have no double precision and the Metal shading language has no `double` type. On NVIDIA it is a choice, and the reasoning is in [double precision](#double-precision-on-nvidia). Agreement with the CPU path is therefore at the single-precision level, a few times `1e-4` on field amplitudes for a saturating run, and the section on [accuracy](#what-agreement-to-expect) puts that number in context against the things a user changes without thinking about them.
 
@@ -242,7 +242,7 @@ export FI_PROVIDER=tcp
 ../../build-cuda/genesis4 validate.in       # or ../../build-metal/genesis4
 ```
 
-Set `FI_PROVIDER=tcp` before anything else if you are using conda's MPICH; the [performance notes](#performance-notes) explain why. It is worth 40% even on this single-rank run, which performs no communication at all, and a factor of four on a run with several ranks.
+Set `FI_PROVIDER=tcp` before anything else if your MPICH goes through libfabric, as conda's macOS build does; the [performance notes](#performance-notes) explain why, and how to tell whether it applies to your build at all. Where it does apply it is worth 40% even on this single-rank run, which performs no communication whatever, and a factor of four on a run with several ranks.
 
 This is a steady-state run of the ARAMIS undulator with the shot noise switched off and a seeded field, so it is deterministic, and it runs both paths and compares them at every step. The last line is the point of it.
 
@@ -417,7 +417,7 @@ The same deck takes 3.70 s on one core of the 285K and 3.75 s on one of the M3 M
 
 A step the backend refuses would cost more than it looks, because the particles and the field would have to come back to the host before it and go out again afterwards, making that step slower than the same step on the CPU alone. Correctors used to be refused, and since `orbiterror = true` is implemented as a corrector at every step, an orbit-error deck spent 187 of its 196 steps that way and lost about two thirds of the benefit of the GPU. Nothing falls back today.
 
-`export FI_PROVIDER=tcp` is not optional if you are using conda's MPICH on macOS. The default libfabric provider busy-polls while waiting, and the faster the compute becomes the more of the machine that wastes.
+`export FI_PROVIDER=tcp` is not optional if your MPICH talks through libfabric, which conda's macOS build does by default. Its default provider busy-polls while waiting, and the faster the compute becomes the more of the machine that wastes. The variable is a libfabric one, so it is worth checking whether it applies before concluding anything from a timing: `mpichversion | grep Device` reports the netmod, and a build configured `ch4:ucx` never reaches libfabric, which makes `FI_PROVIDER` inert. Conda's Linux MPICH is built `ch4:ucx,ofi` and prefers UCX, so on a cluster the knob is usually `UCX_TLS` instead — `UCX_TLS=self,sm` confines a single-node run to shared memory — and `UCX_LOG_LEVEL=error` silences the RoCE probe warnings UCX prints at startup, which are harmless and unrelated to Genesis.
 
 | | without | with |
 |---|---:|---:|

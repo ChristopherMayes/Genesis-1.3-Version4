@@ -437,7 +437,12 @@ steady-state `&wake` abort found during the CUDA port went the same way, as
   now used in `Diagnostic.cpp`, `Field.cpp` and the backend. Nobody noticed because the
   traditional Genesis convention is an odd `ngrid`; the GPU only takes powers of two.
 
-- `export FI_PROVIDER=tcp` is required on macOS with conda MPICH — the default libfabric
+- `export FI_PROVIDER=tcp` is a libfabric knob, not a universal one. Conda's Linux MPICH is
+  built `ch4:ucx,ofi` and prefers UCX, so it never reaches libfabric and the variable is inert;
+  `mpichversion | grep Device` says which netmod you have, and on UCX the equivalent is
+  `UCX_TLS` (`self,sm` for a single node). `sweep.py` therefore sets it only when the
+  environment has not, since forcing tcp where the ofi netmod has a fast provider is a
+  downgrade. Required on macOS with conda MPICH — the default libfabric
   provider busy-polls and costs **5.9× at 8 ranks** (96.0 s → 16.3 s). Worth a manual note.
 - `ngrid = 255 = 3 × 5 × 17` is a pathological FFT length: 59.7 s vs 38.3 s at 256 on the same
   case. Worth a manual note or a warning at startup.

@@ -78,9 +78,22 @@ A steady-state deck is worth trying too, since that is where an interactive
 parameter scan usually lives. `validate.in` with `gpu_validate` switched off is
 one slice over 1104 steps.
 
-`export FI_PROVIDER=tcp` is not optional. Conda's MPICH busy-polls while it
-waits, and the faster the compute the more of the machine that wastes: a factor
-of four even on a serial run with no MPI communication in it at all.
+`export FI_PROVIDER=tcp` is not optional *if* your MPICH talks through
+libfabric, which conda's macOS build does by default. Its default provider
+busy-polls while it waits, and the faster the compute the more of the machine
+that wastes: a factor of four even on a serial run with no MPI communication in
+it at all.
+
+Check before assuming it applies to you, because the variable is a libfabric
+one and a build configured `ch4:ucx` never reaches libfabric:
+
+```sh
+mpichversion | grep Device      # ch4:ofi -> set it; ch4:ucx -> it does nothing
+```
+
+On a UCX build the equivalent knob is `UCX_TLS`, and `UCX_TLS=self,sm` keeps a
+single-node run out of the InfiniBand path. `UCX_LOG_LEVEL=error` silences the
+RoCE probe warnings UCX emits at startup on a cluster, which are harmless.
 
 `compare.py` needs `h5py` and `numpy`, which the conda environment used to
 *build* Genesis will not have unless you add them

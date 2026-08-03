@@ -495,7 +495,14 @@ def run(genesis, mpirun, workdir, case, name, gpu, ranks):
     with open(deck, "w") as f:
         f.write(render(case, name, gpu))
     cmd = ([mpirun, "-n", str(ranks)] if ranks > 1 else []) + [genesis, name + ".in"]
-    env = dict(os.environ, FI_PROVIDER="tcp")
+    # The default libfabric provider in conda's MPICH busy-polls while it waits,
+    # which costs more the faster the compute is, and tcp avoids it. That is a
+    # property of the libfabric netmod rather than of MPICH: a build configured
+    # ch4:ucx never reaches libfabric and the variable does nothing. Only set it
+    # if the environment has not, since forcing tcp on a machine whose ofi netmod
+    # has a fast provider would be a downgrade rather than a fix.
+    env = dict(os.environ)
+    env.setdefault("FI_PROVIDER", "tcp")
     t0 = time.time()
     p = subprocess.run(cmd, cwd=workdir, env=env, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True)
