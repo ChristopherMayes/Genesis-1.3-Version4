@@ -442,7 +442,7 @@ from the fourth entry down.
   undefined `_ompi_mpi_*` symbols. The override runs after `project()`, so CMake had already
   detected conda's clang and derived every flag from it; swapping only the C++ compiler left
   the C compiler and the flags conda's and pulled MacPorts' static parallel HDF5 into a link
-  that had no MPI library in it. Now an option, `USE_MACPORTS_H5PCC`, still defaulting on so
+  that had no MPI library in it. Now an option, `USE_HDF5_COMPILER_WRAPPER`, still defaulting on so
   that a MacPorts-only machine is unaffected, and it warns at configure time when the two
   compilers come from different places, which is the whole of the diagnosis.
 - If FFTW is not found, `FieldSolverFFT` silently produces wrong results rather than failing

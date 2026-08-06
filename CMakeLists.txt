@@ -47,34 +47,39 @@ list(APPEND _libraries)
 # It therefore stays the default where it is present, since that is what a
 # MacPorts-only machine wants, but it can be switched off, and it says both that
 # it happened and how to decline it.
-option(USE_MACPORTS_H5PCC
-       "On macOS, use MacPorts' h5pcc wrapper as the C++ compiler when present" ON)
-set(MACPORTS_H5PCC "/opt/local/bin/h5pcc" CACHE FILEPATH
-    "Path to the MacPorts HDF5 compiler wrapper")
+option(USE_HDF5_COMPILER_WRAPPER
+       "Use an HDF5 compiler wrapper when present, instead of finding MPI and \
+HDF5 with find_package" ON)
+set(HDF5_COMPILER_WRAPPER "/opt/local/bin/h5pcc" CACHE FILEPATH
+    "Path to the HDF5 compiler wrapper to prefer, if it exists")
 
-if(USE_MACPORTS_H5PCC AND EXISTS "${MACPORTS_H5PCC}")
-  set(CMAKE_CXX_COMPILER "${MACPORTS_H5PCC}")
-  message(STATUS "Using ${MACPORTS_H5PCC} as the C++ compiler "
-                 "(-DUSE_MACPORTS_H5PCC=OFF to use your own)")
+set(_hdf5_wrapper_in_use FALSE)
+if(USE_HDF5_COMPILER_WRAPPER AND EXISTS "${HDF5_COMPILER_WRAPPER}")
+  set(CMAKE_CXX_COMPILER "${HDF5_COMPILER_WRAPPER}")
+  set(_hdf5_wrapper_in_use TRUE)
+  message(STATUS "Using ${HDF5_COMPILER_WRAPPER} as the C++ compiler "
+                 "(-DUSE_HDF5_COMPILER_WRAPPER=OFF to use your own)")
 
   # The mix is worth naming before it becomes a link error rather than after.
-  get_filename_component(_h5pcc_dir "${MACPORTS_H5PCC}" DIRECTORY)
+  get_filename_component(_h5pcc_dir "${HDF5_COMPILER_WRAPPER}" DIRECTORY)
   get_filename_component(_cc_dir "${CMAKE_C_COMPILER}" DIRECTORY)
   if(NOT _cc_dir STREQUAL _h5pcc_dir)
     message(WARNING
-      "The C++ compiler is now ${MACPORTS_H5PCC} but the C compiler is still "
+      "The C++ compiler is now ${HDF5_COMPILER_WRAPPER} but the C compiler is still "
       "${CMAKE_C_COMPILER}, so this build mixes two toolchains and will link "
       "against two HDF5 and MPI installations. If you meant to build with a "
       "conda environment or any other self-contained toolchain, configure with "
-      "-DUSE_MACPORTS_H5PCC=OFF.")
+      "-DUSE_HDF5_COMPILER_WRAPPER=OFF.")
   endif()
 endif()
 
 
-if (CMAKE_CXX_COMPILER MATCHES  "h5pcc")
-   Message(STATUS "h5pcc compiler wrapper found - No additional libraries needed")
+# The name match is kept as well as the flag, because passing the wrapper
+# directly as CMAKE_CXX_COMPILER has always worked and should go on working.
+if (_hdf5_wrapper_in_use OR CMAKE_CXX_COMPILER MATCHES "h5pcc")
+   Message(STATUS "HDF5 compiler wrapper in use - No additional libraries needed")
 else()
-   Message(STATUS "No h5pcc wrapper in use - looking for compiler, MPI and HDF5")
+   Message(STATUS "No HDF5 compiler wrapper in use - looking for compiler, MPI and HDF5")
    Message(STATUS "C++ Compiler: ${CMAKE_CXX_COMPILER}")
    Message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
 
