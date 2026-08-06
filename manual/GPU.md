@@ -73,7 +73,11 @@ cmake --build build-metal -j8
 
 Look for `-- Metal GPU backend enabled` in the configure output. `ENABLE_METAL` defaults to `OFF` and is a hard error on anything that is not macOS.
 
-Two properties of `CMakeLists.txt` are worth knowing on a Mac. It will use `/opt/local/bin/h5pcc` as the C++ compiler if that file exists, overriding `CMAKE_CXX_COMPILER`, so a MacPorts installation can quietly hijack a conda build. And if FFTW is not found the build still succeeds, but a deck asking for `fft_fieldsolver = true` is then given the ADI solver without being told, so check for `-- FFTW found` as well. That last point applies to both backends.
+Two properties of `CMakeLists.txt` are worth knowing on a Mac.
+
+The first is that MacPorts can hijack the build. If `/opt/local/bin/h5pcc` exists, it is taken as the C++ compiler in preference to whatever else was chosen, which is right on a machine where MacPorts is the whole toolchain and wrong on one where it is merely also installed: the C compiler and every flag still come from the conda environment, and the link then goes out against two HDF5 and MPI installations. Everything compiles and the failure arrives at the very end, as a page of undefined `_ompi_mpi_*` symbols that says nothing about its cause. Configure now warns when the two compilers come from different places; if that describes your machine, add `-DUSE_MACPORTS_H5PCC=OFF` and check that the output says `MPI Found` and `HDF5 Found` rather than naming a wrapper.
+
+The second is that if FFTW is not found the build still succeeds, but a deck asking for `fft_fieldsolver = true` is then given the ADI solver without being told, so check for `-- FFTW found` as well. That one applies to both backends.
 
 ## Switching it on
 
