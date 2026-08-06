@@ -14,12 +14,14 @@ Version 4.6.12 has been released
 * [Compilation](manual/INSTALLATION.md)
 * [Main Input File](manual/MAIN_INPUT.md)
 * [Lattice File](manual/LATTICE.md)
+* [GPU Acceleration on Apple Silicon](manual/GPU.md)
 
 **Examples** ([Overview](examples/)):
 * [Example 1 - Steady State](examples/Example1-SteadyState/)
 * [Example 2 - Field and Particle Dumps](examples/Example2-Dumps/)
 * [Example 3 - Time-dependent Simulation](examples/Example3-TimeDependent/)
 * [Example 4 - HGHG Simulation](examples/Example4-HGHG/)
+* [GPU acceleration](examples/gpu/)
 
 
 

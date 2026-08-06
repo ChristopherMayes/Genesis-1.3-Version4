@@ -1,5 +1,7 @@
 #include "Track.h"
 #include "Gencore.h"
+#include "GPUEngine.h"
+#include <sstream>
 
 Track::Track()
 {
@@ -12,6 +14,8 @@ Track::Track()
   exclharm = false;
   fftsolver = false;
   periodic = false;
+  gpu = false;
+  gpuValidate = false;
 }
 
 Track::~Track(){}
@@ -36,6 +40,8 @@ void Track::usage(){
   cout << " double xcut = 1 " << endl;
   cout << " double ycut = 1 " << endl;
   cout << " double sigmoid = 1" << endl;
+  cout << " bool gpu = false" << endl;
+  cout << " bool gpu_validate = false" << endl;
   cout << "&end" << endl << endl;
   /* currently undocumented debugging options: dbg_report_lattice, dbg_suppress_outfile */
 
@@ -94,6 +100,8 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
   if (arg->find("ycut")!=end)     {yc= atof(arg->at("ycut").c_str());  arg->erase(arg->find("ycut"));}
   if (arg->find("sigmoid")!=end)     {sig= atof(arg->at("sigmoid").c_str());  arg->erase(arg->find("sigmoid"));}
   if (arg->find("source_filter")!=end) {doFilter = atob(arg->at("source_filter")); arg->erase(arg->find("source_filter"));}
+  if (arg->find("gpu")!=end) {gpu = atob(arg->at("gpu")); arg->erase(arg->find("gpu"));}
+  if (arg->find("gpu_validate")!=end) {gpuValidate = atob(arg->at("gpu_validate")); arg->erase(arg->find("gpu_validate"));}
   if (arg->size()!=0){
     if (rank==0){ cout << "*** Error: Unknown elements in &track" << endl; this->usage();}
     return false;
@@ -102,6 +110,33 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
   filter.beam.harm = bunchharm;
   filter.beam.exclharm = exclharm;
   if (output_step < 1) { output_step=1; }
+
+  // Options the GPU backend cannot honour. Each of these would otherwise run
+  // to completion and write an output file, having quietly done something
+  // other than what the deck asked for, so they are refused here rather than
+  // worked around. The check is on the namelist values so that the message can
+  // name the keyword the user actually wrote. A binary built without a backend
+  // has nothing to check against and lets Gencore report that instead.
+  if ((gpu || gpuValidate) && !GPUEngine::backend().empty()) {
+    string clash;
+    if (!fftsolver) {
+      clash = "the GPU propagates the field by FFT and has no ADI solver, so "
+              "fft_fieldsolver = true is required";
+    } else if (bunchharm > GPUEngine::maxBunchHarm()) {
+      stringstream ss;
+      ss << "bunchharm = " << bunchharm << ", but the GPU diagnostic reduction "
+         << "goes up to " << GPUEngine::maxBunchHarm()
+         << ". The particles stay on the GPU, so there is no host copy to "
+            "compute the higher harmonics from";
+      clash = ss.str();
+    }
+    if (!clash.empty()) {
+      if (rank == 0) {
+        cout << "*** Error: gpu = true in &track, but " << clash << endl;
+      }
+      return false;
+    }
+  }
 
   // select solver
 #ifndef FFTW
@@ -168,7 +203,7 @@ bool Track::init(int inrank, int insize, map<string,string> *arg, Beam *beam, ve
 
   // call to gencore to do the actual tracking.  
   Gencore core;
-  if(!core.run(beam,field,setup,und,isTime,isScan, periodic, filter)) {
+  if(!core.run(beam,field,setup,und,isTime,isScan, periodic, filter, gpu, gpuValidate)) {
     /* execution of simulation was not successful, for instance because of IO error during a file write triggered by marker */
     if  (rank==0) { cout << "End of Track (after error)" << endl;}
     delete und;

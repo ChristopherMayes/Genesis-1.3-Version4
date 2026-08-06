@@ -26,6 +26,7 @@ class Undulator;
 class Setup;
 
 #include "DiagnosticBase.h"
+#include "SliceMoments.h"
 #ifdef USE_DPI
   #include "DiagnosticHook.h"
 #endif
@@ -39,17 +40,25 @@ class DiagBeam: public DiagBeamBase{
 private:
     unsigned int nharm {1};    // beam specific for calculating harmonics in the bunching
     bool exclharm {false};
+    // When set, the per-slice moments have already been reduced elsewhere (on
+    // the GPU) and the particle loops below are skipped. Nothing else changes:
+    // the same expressions are evaluated and the same tags are stored.
+    const BeamSliceMoments *pre {nullptr};
 public:
     ~DiagBeam() = default;
     DiagBeam() = default; // this is needed since the harmonics can be changed
+    void usePrecomputed(const BeamSliceMoments *m) { pre = m; }
     std::map<std::string,OutputInfo> getTags(FilterDiagnostics &filter);
     void getValues(Beam *, std::map<std::string,std::vector<double> > &, int) ;
 };
 
 class DiagField: public DiagFieldBase{
+private:
+    const FieldSliceMoments *pre {nullptr};
 public:
     ~DiagField() = default;
     DiagField() = default; // this is needed since the harmonics can be changed
+    void usePrecomputed(const FieldSliceMoments *m) { pre = m; }
     std::map<std::string,OutputInfo> getTags(FilterDiagnostics &filter);
     void getValues(Field *, std::map<std::string,std::vector<double> > &, int) ;
 
@@ -101,6 +110,10 @@ public:
     virtual ~Diagnostic();
     void init(int,int, int, int,int,bool,bool, FilterDiagnostics &);
     void calc(Beam *, std::vector<Field*> *,double);
+    // Same, but with the per-slice moments already reduced by the caller. A
+    // null entry falls back to the normal in-place reduction.
+    void calc(Beam *, std::vector<Field*> *, double,
+              const BeamSliceMoments *, const std::vector<FieldSliceMoments> *);
     bool writeToOutputFile(Beam *, vector<Field*> *, Setup *, Undulator *);
 
     std::vector<std::map<std::string,std::vector<double> > > val;

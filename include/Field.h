@@ -32,6 +32,9 @@ class Field{
    virtual ~Field();
    void initDiagnostics(int);
    void initSolver(bool,bool,double,double,double);
+   bool getSourceFilter(double &xc, double &yc, double &sig) const {
+       return hasSolver_ ? solver->getSourceFilter(xc, yc, sig) : false;
+   }
    void diagnostics(bool);
    void resetSlippage();
 

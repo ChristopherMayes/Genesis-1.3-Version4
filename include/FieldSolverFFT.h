@@ -27,6 +27,11 @@ class FieldSolverFFT : public FieldSolver{
    void init(double,double,double,unsigned int);
    void advance(double, Field *, Beam *, Undulator *);
    void initSourceFilter(double,double,double,bool);
+   bool getSourceFilter(double &xc_out, double &yc_out, double &sig_out) const override {
+       if (!doFilter_) { return false; }
+       xc_out = xc; yc_out = yc; sig_out = sig;
+       return true;
+   }
 
  private:
     unsigned int ngrid {0} ;

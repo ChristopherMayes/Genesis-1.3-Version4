@@ -112,6 +112,48 @@ void Beam::track(double delz,vector<Field *> *field, Undulator *und){
   solver.track(delz*0.5,this,und,true);      }
 
 
+// Computes the per-slice wakefield loss into 'eloss' without advancing the
+// particles, for backends that hold the particles somewhere other than the host
+// arrays. Returns false if no wake is defined.
+bool Beam::computeWakeLoss(Undulator *und)
+{
+  return col.computeLoss(this, und);
+}
+
+
+// Same idea for the incoherent radiation: the energy kick of one step, one
+// value per beamlet, with the particles left alone. See Incoherent::computeKick
+// for why this draws from its own generator.
+bool Beam::computeIncoherentKick(Undulator *und, double delz, vector<double> &dg)
+{
+  return incoherent.computeKick(this, und, delz, dg);
+}
+
+
+// Short-range space charge, for a backend holding the particles elsewhere. The
+// caller supplies the largest particle radius of each slice, which is the only
+// thing the host needs from the particles, and gets back the parameters of the
+// solve. See EFieldSolver::planShortRange for why the radial grid has to be
+// advanced over the slices in order.
+bool Beam::planShortRangeSC(const vector<double> &rbound, double gz2, SCPlan &plan)
+{
+  return solver.planShortRangeSC(rbound, gz2, plan);
+}
+
+void Beam::setSCField(int islice, double v)
+{
+  solver.setSCFieldOut(islice, v);
+}
+
+
+// Reports any effect that Beam::track applies but the GPU backend does not yet
+// implement. Used to refuse GPU tracking rather than silently dropping physics.
+bool Beam::gpuUnsupportedPhysics(string &what) const
+{
+  return false;
+}
+
+
 
 void Beam::report_storage(string infotxt)
 {

@@ -4,3 +4,5 @@
 [Main Input File](MAIN_INPUT.md)
 
 [Lattice File](LATTICE.md)
+
+[GPU Acceleration](GPU.md)

@@ -155,7 +155,7 @@ bool Control::init(int inrank, int insize, const string in_rootname, Beam *beam,
 
 
 
-void Control::applySlippage(double slippage, Field *field) {
+void Control::applySlippage(double slippage, Field *field, int ifld, SliceSync *sync) {
   if (timerun==false) { return; }
 
  
@@ -207,6 +207,11 @@ void Control::applySlippage(double slippage, Field *field) {
     if (direction<0){
       last=(last+1) % field->field.size();  //  this actually first because it is sent backwards
     }
+
+    // Bring that one slice back from the accelerator, and hand the result back
+    // afterwards. Done unconditionally so that the round trip is correct even
+    // in the cases below that leave the slice untouched.
+    if (sync != nullptr) { sync->pullSlice(ifld, static_cast<int>(last)); }
 
     // Prevent transfer sizes resulting in overflow (MPI_send argument 'count' has data type 'int').
     // For typical transverse grid sizes, this is not a relevant limitation.
@@ -265,6 +270,8 @@ void Control::applySlippage(double slippage, Field *field) {
         }
       }
     }
+
+    if (sync != nullptr) { sync->pushSlice(ifld, static_cast<int>(last)); }
 
     // last was the last slice to be transmitted to the succeding node and then filled with the
     // the field from the preceeding node, making it now the start of the field record.

@@ -1,0 +1,52 @@
+# Timing and accuracy reference, GPU half. See sase_cpu.in.
+#
+#   genesis4 sase_gpu.in
+#
+# One rank is enough: the report at the end of the run shows the device already
+# better than 90% busy, so extra MPI ranks pointed at the same GPU only share
+# out the work they are queueing for. To compare against sase_cpu.in, run that
+# one at the rank count you would actually use for a CPU run, and see the
+# warning there about comparing output files across different rank counts.
+
+&setup
+rootname=sase_gpu
+lattice=Aramis.lat
+beamline=ARAMIS
+lambda0=1e-10
+gamma0=11357.82
+delz=0.045000
+shotnoise=1
+seed=1001
+nbins=8
+beam_global_stat=true
+field_global_stat=true
+&end
+
+&lattice
+zmatch=9.5
+&end
+
+&time
+slen=4.0e-7
+sample=8
+&end
+
+&field
+power=0
+dgrid=2.000000e-04
+ngrid=256
+waist_size=30e-6
+&end
+
+&beam
+current=3000
+delgam=1.000000
+ex=4.000000e-07
+ey=4.000000e-07
+&end
+
+&track
+gpu=true
+fft_fieldsolver=true
+zstop=10
+&end

@@ -260,17 +260,34 @@ bool Diagnostic::writeToOutputFile(Beam *beam, vector<Field*> *field, Setup *set
 
 // wrapper to do all the diagnostics calculation at a given integration step iz.
 void Diagnostic::calc(Beam* beam,std::vector<Field*> *field,double z) {
+    this->calc(beam, field, z, nullptr, nullptr);
+}
+
+void Diagnostic::calc(Beam* beam,std::vector<Field*> *field,double z,
+                      const BeamSliceMoments *bm,
+                      const std::vector<FieldSliceMoments> *fm) {
     // lock the vectors holding the instances of diagnostic classes
     diag_can_add=false;
 
     zout[iz]=z;
     for (auto group: dbeam){
+        // only the official beam diagnostic knows how to take precomputed
+        // moments; user diagnostics keep reducing the particles themselves
+        DiagBeam *db = dynamic_cast<DiagBeam*>(group);
+        if (db != nullptr) { db->usePrecomputed(bm); }
         group->getValues(beam,val[2],iz);
+        if (db != nullptr) { db->usePrecomputed(nullptr); }
     }
 
     for (int ifld=0; ifld < field->size(); ifld++){
         for (auto group: dfield) {
+            DiagField *df = dynamic_cast<DiagField*>(group);
+            const FieldSliceMoments *m =
+                (fm != nullptr && ifld < static_cast<int>(fm->size())) ? &fm->at(ifld)
+                                                                       : nullptr;
+            if (df != nullptr) { df->usePrecomputed(m); }
             group->getValues(field->at(ifld),val[3+ifld],iz);
+            if (df != nullptr) { df->usePrecomputed(nullptr); }
         }
     }
     iz++;
@@ -384,6 +401,70 @@ void DiagBeam::getValues(Beam *beam,std::map<std::string,std::vector<double> >&v
     double g_y1=0;
     double g_y2=0;
 
+    // Resolve every destination array and every filter flag once, rather than
+    // once per slice: about thirty-five lookups by string per slice, plus an
+    // snprintf and a string construction for each harmonic key. On the CPU path
+    // that is below the noise, since the time here goes into the reduction loop
+    // below; it matters on the GPU path, where the reduction has moved to the
+    // device and the bookkeeping is all that is left.
+    const bool wantEnergy  = filter["energy"];
+    const bool wantSpatial = filter["spatial"];
+    const bool wantAux     = filter["aux"];
+    const bool currentOnce = tags["current"].once;
+    const bool twissOnce   = tags["emitx"].once;
+
+    std::vector<double> *v_energy       = resolveValue(val, "energy");
+    std::vector<double> *v_energyspread = resolveValue(val, "energyspread");
+    std::vector<double> *v_xposition    = resolveValue(val, "xposition");
+    std::vector<double> *v_xsize        = resolveValue(val, "xsize");
+    std::vector<double> *v_yposition    = resolveValue(val, "yposition");
+    std::vector<double> *v_ysize        = resolveValue(val, "ysize");
+    std::vector<double> *v_pxposition   = resolveValue(val, "pxposition");
+    std::vector<double> *v_pyposition   = resolveValue(val, "pyposition");
+    std::vector<double> *v_bunching     = resolveValue(val, "bunching");
+    std::vector<double> *v_bunchphase   = resolveValue(val, "bunchingphase");
+    std::vector<double> *v_efield       = resolveValue(val, "efield");
+    std::vector<double> *v_wakefield    = resolveValue(val, "wakefield");
+    std::vector<double> *v_LSCfield     = resolveValue(val, "LSCfield");
+    std::vector<double> *v_SSCfield     = resolveValue(val, "SSCfield");
+    std::vector<double> *v_xmin         = resolveValue(val, "xmin");
+    std::vector<double> *v_xmax         = resolveValue(val, "xmax");
+    std::vector<double> *v_pxmin        = resolveValue(val, "pxmin");
+    std::vector<double> *v_pxmax        = resolveValue(val, "pxmax");
+    std::vector<double> *v_ymin         = resolveValue(val, "ymin");
+    std::vector<double> *v_ymax         = resolveValue(val, "ymax");
+    std::vector<double> *v_pymin        = resolveValue(val, "pymin");
+    std::vector<double> *v_pymax        = resolveValue(val, "pymax");
+    std::vector<double> *v_emin         = resolveValue(val, "emin");
+    std::vector<double> *v_emax         = resolveValue(val, "emax");
+    std::vector<double> *v_current      = resolveValue(val, "current");
+    std::vector<double> *v_emitx        = resolveValue(val, "emitx");
+    std::vector<double> *v_emity        = resolveValue(val, "emity");
+    std::vector<double> *v_betax        = resolveValue(val, "betax");
+    std::vector<double> *v_betay        = resolveValue(val, "betay");
+    std::vector<double> *v_alphax       = resolveValue(val, "alphax");
+    std::vector<double> *v_alphay       = resolveValue(val, "alphay");
+
+    // The harmonic keys are built with snprintf, so resolve them into a list
+    // that mirrors exactly which harmonics the original code wrote.
+    std::vector<int> harmIdx;
+    std::vector<std::vector<double>*> v_bunchHarm, v_bunchPhaseHarm;
+    {
+        char key[100];
+        auto addHarmonic = [&](int iharm) {
+            harmIdx.push_back(iharm);
+            snprintf(key, sizeof(key), "bunching%d", iharm + 1);
+            v_bunchHarm.push_back(resolveValue(val, key));
+            snprintf(key, sizeof(key), "bunchingphase%d", iharm + 1);
+            v_bunchPhaseHarm.push_back(resolveValue(val, key));
+        };
+        if (exclharm && (nharm > 1)) {
+            addHarmonic(nharm - 1);
+        } else {
+            for (int iharm = 1; iharm < nharm; iharm++) { addHarmonic(iharm); }
+        }
+    }
+
     for (auto const &slice :beam->beam) {
         double g1 = 0;
         double g2 = 0;
@@ -412,140 +493,136 @@ void DiagBeam::getValues(Beam *beam,std::map<std::string,std::vector<double> >&v
         for (int iharm = 0; iharm < nharm; iharm++) {
             b[iharm] = 0;
         }
-        for (auto const &par: slice) {
-            x1 += par.x;
-            x2 += par.x * par.x;
-            y1 += par.y;
-            y2 += par.y * par.y;
-            g1 += par.gamma;
-            g2 += par.gamma * par.gamma;
-            px1 += par.px;
-            py1 += par.py;
-            px2 += par.px * par.px;
-            py2 += par.py * par.py;
-            xpx += par.x * par.px;
-            ypy += par.y * par.py;
-//           complex<double> phasor = complex<double> (cos(par.theta),sin(par.theta));
-//           complex<double> phasor_acc = phasor;
-//           b[0] += phasor;
-            for (int iharm = 0; iharm < nharm; iharm++) {
-                //              phasor_acc *= phasor;
-//               b[iharm]+=phasor_acc;
-                b[iharm] += complex<double>(cos((iharm + 1) * par.theta), sin((iharm + 1) * par.theta));
-//                b[iharm]+=phasor*phasor;
+        if (pre != nullptr) {
+            x1 = pre->x1[is];   x2 = pre->x2[is];
+            y1 = pre->y1[is];   y2 = pre->y2[is];
+            px1 = pre->px1[is]; px2 = pre->px2[is];
+            py1 = pre->py1[is]; py2 = pre->py2[is];
+            g1 = pre->g1[is];   g2 = pre->g2[is];
+            xpx = pre->xpx[is]; ypy = pre->ypy[is];
+            for (int iharm = 0; iharm < nharm && iharm < pre->nharm; iharm++) {
+                b[iharm] = complex<double>(pre->bre[is * pre->nharm + iharm],
+                                           pre->bim[is * pre->nharm + iharm]);
             }
-        }
-        if (filter["aux"]) {
+            if (wantAux && pre->hasAux) {
+                xmin = pre->xmin[is];   xmax = pre->xmax[is];
+                pxmin = pre->pxmin[is]; pxmax = pre->pxmax[is];
+                ymin = pre->ymin[is];   ymax = pre->ymax[is];
+                pymin = pre->pymin[is]; pymax = pre->pymax[is];
+                gmin = pre->gmin[is];   gmax = pre->gmax[is];
+            }
+        } else {
             for (auto const &par: slice) {
-                if (par.x < xmin) { xmin = par.x; }
-                if (par.x > xmax) { xmax = par.x; }
-                if (par.px < pxmin) { pxmin = par.px; }
-                if (par.px > pxmax) { pxmax = par.px; }
-                if (par.y < ymin) { ymin = par.y; }
-                if (par.y > ymax) { ymax = par.y; }
-                if (par.py < pymin) { pymin = par.py; }
-                if (par.py > pymax) { pymax = par.py; }
-                if (par.gamma < gmin) { gmin = par.gamma; }
-                if (par.gamma > gmax) { gmax = par.gamma; }
+                x1 += par.x;
+                x2 += par.x * par.x;
+                y1 += par.y;
+                y2 += par.y * par.y;
+                g1 += par.gamma;
+                g2 += par.gamma * par.gamma;
+                px1 += par.px;
+                py1 += par.py;
+                px2 += par.px * par.px;
+                py2 += par.py * par.py;
+                xpx += par.x * par.px;
+                ypy += par.y * par.py;
+    //           complex<double> phasor = complex<double> (cos(par.theta),sin(par.theta));
+    //           complex<double> phasor_acc = phasor;
+    //           b[0] += phasor;
+                for (int iharm = 0; iharm < nharm; iharm++) {
+                    //              phasor_acc *= phasor;
+    //               b[iharm]+=phasor_acc;
+                    b[iharm] += complex<double>(cos((iharm + 1) * par.theta), sin((iharm + 1) * par.theta));
+    //                b[iharm]+=phasor*phasor;
+                }
             }
-        }
-        double norm = 1.;
-        if (!slice.empty()) {
-            norm = 1. / static_cast<double>(slice.size());
-        }
-        // normalize the values
-        x1 *= norm;
-        x2 *= norm;
-        y1 *= norm;
-        y2 *= norm;
-        px1 *= norm;
-        px2 *= norm;
-        py1 *= norm;
-        py2 *= norm;
-        g1 *= norm;
-        g2 *= norm;
-        xpx *= norm;
-        ypy *= norm;
-        for (int iharm = 0; iharm < nharm; iharm++) {
-            b[iharm] *= norm;
+            if (wantAux) {
+                for (auto const &par: slice) {
+                    if (par.x < xmin) { xmin = par.x; }
+                    if (par.x > xmax) { xmax = par.x; }
+                    if (par.px < pxmin) { pxmin = par.px; }
+                    if (par.px > pxmax) { pxmax = par.px; }
+                    if (par.y < ymin) { ymin = par.y; }
+                    if (par.y > ymax) { ymax = par.y; }
+                    if (par.py < pymin) { pymin = par.py; }
+                    if (par.py > pymax) { pymax = par.py; }
+                    if (par.gamma < gmin) { gmin = par.gamma; }
+                    if (par.gamma > gmax) { gmax = par.gamma; }
+                }
+            }
+            double norm = 1.;
+            if (!slice.empty()) {
+                norm = 1. / static_cast<double>(slice.size());
+            }
+            // normalize the values
+            x1 *= norm;
+            x2 *= norm;
+            y1 *= norm;
+            y2 *= norm;
+            px1 *= norm;
+            px2 *= norm;
+            py1 *= norm;
+            py2 *= norm;
+            g1 *= norm;
+            g2 *= norm;
+            xpx *= norm;
+            ypy *= norm;
+            for (int iharm = 0; iharm < nharm; iharm++) {
+                b[iharm] *= norm;
+            }
         }
 
         //-------------------------------------------------------------------------------
         // save into the allocated memory space
         int idx = iz * ns + is;         // index for saving the data
-        if (filter["energy"]) {
-            this->storeValue(val, "energy", idx, g1);
-            this->storeValue(val, "energyspread", idx, sqrt(fabs(g2 - g1 * g1)));
+        if (wantEnergy) {
+            putValue(v_energy, idx, g1);
+            putValue(v_energyspread, idx, sqrt(fabs(g2 - g1 * g1)));
         }
-        if (filter["spatial"]) {
-            this->storeValue(val, "xposition", idx, x1);
-            this->storeValue(val, "xsize", idx, sqrt(fabs(x2 - x1 * x1)));
-            this->storeValue(val, "yposition", idx, y1);
-            this->storeValue(val, "ysize", idx, sqrt(fabs(y2 - y1 * y1)));
-            this->storeValue(val, "pxposition", idx, px1);
-            this->storeValue(val, "pyposition", idx, py1);
+        if (wantSpatial) {
+            putValue(v_xposition, idx, x1);
+            putValue(v_xsize, idx, sqrt(fabs(x2 - x1 * x1)));
+            putValue(v_yposition, idx, y1);
+            putValue(v_ysize, idx, sqrt(fabs(y2 - y1 * y1)));
+            putValue(v_pxposition, idx, px1);
+            putValue(v_pyposition, idx, py1);
         }
-        this->storeValue(val, "bunching", idx, std::abs(b[0]));
-        this->storeValue(val, "bunchingphase", idx, atan2(b[0].imag(), b[0].real()));
-        char buff[100];
-        if (exclharm && (nharm>1)){
-            snprintf(buff, sizeof(buff), "bunching%d", nharm);
-            this->storeValue(val, buff, idx, std::abs(b[nharm-1]));
-            snprintf(buff, sizeof(buff), "bunchingphase%d", nharm);
-            this->storeValue(val, buff, idx, atan2(b[nharm-1].imag(), b[nharm-1].real()));
-        } else {
-            for (int iharm = 1; iharm < nharm; iharm++) {
-                snprintf(buff, sizeof(buff), "bunching%d", iharm + 1);
-                this->storeValue(val, buff, idx, std::abs(b[iharm]));
-                snprintf(buff, sizeof(buff), "bunchingphase%d", iharm + 1);
-                this->storeValue(val, buff, idx, atan2(b[iharm].imag(), b[iharm].real()));
-            }
+        putValue(v_bunching, idx, std::abs(b[0]));
+        putValue(v_bunchphase, idx, atan2(b[0].imag(), b[0].real()));
+        for (size_t ih = 0; ih < harmIdx.size(); ih++) {
+            const complex<double> &bh = b[harmIdx[ih]];
+            putValue(v_bunchHarm[ih], idx, std::abs(bh));
+            putValue(v_bunchPhaseHarm[ih], idx, atan2(bh.imag(), bh.real()));
         }
-        if (filter["aux"]) {
-            this->storeValue(val,"efield",idx,beam->eloss[is] + beam->longESC[is]);
-            this->storeValue(val,"wakefield",idx,beam->eloss[is]);
-            this->storeValue(val,"LSCfield",idx,beam->longESC[is]);
-            this->storeValue(val,"SSCfield",idx,beam->getSCField(is));
-            this->storeValue(val,"xmin",idx,xmin);
-            this->storeValue(val,"xmax",idx,xmax);
-            this->storeValue(val,"pxmin",idx,pxmin);
-            this->storeValue(val,"pxmax",idx,pxmax);
-            this->storeValue(val,"ymin",idx,ymin);
-            this->storeValue(val,"ymax",idx,ymax);
-            this->storeValue(val,"pymin",idx,pymin);
-            this->storeValue(val,"pymax",idx,pymax);
-            this->storeValue(val,"emin",idx,gmin);
-            this->storeValue(val,"emax",idx,gmax);
+        if (wantAux) {
+            putValue(v_efield, idx, beam->eloss[is] + beam->longESC[is]);
+            putValue(v_wakefield, idx, beam->eloss[is]);
+            putValue(v_LSCfield, idx, beam->longESC[is]);
+            putValue(v_SSCfield, idx, beam->getSCField(is));
+            putValue(v_xmin, idx, xmin);
+            putValue(v_xmax, idx, xmax);
+            putValue(v_pxmin, idx, pxmin);
+            putValue(v_pxmax, idx, pxmax);
+            putValue(v_ymin, idx, ymin);
+            putValue(v_ymax, idx, ymax);
+            putValue(v_pymin, idx, pymin);
+            putValue(v_pymax, idx, pymax);
+            putValue(v_emin, idx, gmin);
+            putValue(v_emax, idx, gmax);
         }
         // here are all the values which are only evaluated once at the beginning of the run with iz = 0
-        if (tags["current"].once){
-            if (iz ==0) {
-                this->storeValue(val,"current",idx,beam->current[is]);
-            }
-        } else {
-            this->storeValue(val,"current",idx,beam->current[is]);
+        if (!currentOnce || iz == 0) {
+            putValue(v_current, idx, beam->current[is]);
         }
-        if (tags["emitx"].once) {
-            if (iz == 0) {
-                // because genesis works with momenta and not divergence, the emittance does not need energy
-                double ex = sqrt(fabs((x2 - x1 * x1) * (px2 - px1 * px1) - (xpx - x1 * px1) * (xpx - x1 * px1)));
-                double ey = sqrt(fabs((y2 - y1 * y1) * (py2 - py1 * py1) - (ypy - y1 * py1) * (ypy - y1 * py1)));
-                this->storeValue(val, "emitx", idx, ex);
-                this->storeValue(val, "emity", idx, ey);
-                this->storeValue(val, "betax", idx, (x2 - x1 * x1) / ex * g1);
-                this->storeValue(val, "betay", idx, (y2 - y1 * y1) / ey * g1);
-                this->storeValue(val, "alphax", idx, -(xpx - x1 * px1) / ex);
-                this->storeValue(val, "alphay", idx, -(ypy - y1 * py1) / ey);
-            }
-        } else {
+        if (!twissOnce || iz == 0) {
+            // because genesis works with momenta and not divergence, the emittance does not need energy
             double ex = sqrt(fabs((x2 - x1 * x1) * (px2 - px1 * px1) - (xpx - x1 * px1) * (xpx - x1 * px1)));
             double ey = sqrt(fabs((y2 - y1 * y1) * (py2 - py1 * py1) - (ypy - y1 * py1) * (ypy - y1 * py1)));
-            this->storeValue(val, "emitx", idx, ex);
-            this->storeValue(val, "emity", idx, ey);
-            this->storeValue(val, "betax", idx, (x2 - x1 * x1) / ex * g1);
-            this->storeValue(val, "betay", idx, (y2 - y1 * y1) / ey * g1);
-            this->storeValue(val, "alphax", idx, -(xpx - x1 * px1) / ex);
-            this->storeValue(val, "alphay", idx, -(ypy - y1 * py1) / ey);
+            putValue(v_emitx, idx, ex);
+            putValue(v_emity, idx, ey);
+            putValue(v_betax, idx, (x2 - x1 * x1) / ex * g1);
+            putValue(v_betay, idx, (y2 - y1 * y1) / ey * g1);
+            putValue(v_alphax, idx, -(xpx - x1 * px1) / ex);
+            putValue(v_alphay, idx, -(ypy - y1 * py1) / ey);
         }
         //-------------------------------------------------------------------------
         // gather moments for all slices with current as weighting factor
@@ -747,8 +824,28 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
     complex<double> *in  = nullptr;
     complex<double> *out = nullptr;
     fftw_plan p;
-    obtain_FFT_resources(ngrid, &in, &out, &p);
+    if (pre == nullptr) { obtain_FFT_resources(ngrid, &in, &out, &p); }
 #endif
+
+    // Same reasoning as in DiagBeam::getValues: the keys do not vary between
+    // slices, so resolve them and the filter flags once per step.
+    const bool wantSpatial   = filter["spatial"];
+    const bool wantIntensity = filter["intensity"];
+    const bool wantFFT       = filter["fft"];
+
+    std::vector<double> *v_power       = resolveValue(val, "power");
+    std::vector<double> *v_xposition   = resolveValue(val, "xposition");
+    std::vector<double> *v_xsize       = resolveValue(val, "xsize");
+    std::vector<double> *v_yposition   = resolveValue(val, "yposition");
+    std::vector<double> *v_ysize       = resolveValue(val, "ysize");
+    std::vector<double> *v_intenNear   = resolveValue(val, "intensity-nearfield");
+    std::vector<double> *v_phaseNear   = resolveValue(val, "phase-nearfield");
+    std::vector<double> *v_intenFar    = resolveValue(val, "intensity-farfield");
+    std::vector<double> *v_phaseFar    = resolveValue(val, "phase-farfield");
+    std::vector<double> *v_xpointing   = resolveValue(val, "xpointing");
+    std::vector<double> *v_xdivergence = resolveValue(val, "xdivergence");
+    std::vector<double> *v_ypointing   = resolveValue(val, "ypointing");
+    std::vector<double> *v_ydivergence = resolveValue(val, "ydivergence");
 
 
     for (auto const &slice :field->field) {
@@ -760,6 +857,26 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         double y2 = 0;
         complex<double> loc;
         complex<double> ff = complex<double>(0, 0);
+#ifdef FFTW
+        double fpower=0;
+        double fx1=0;
+        double fx2=0;
+        double fy1=0;
+        double fy2=0;
+#endif
+        if (pre != nullptr) {
+            power = pre->power[is0];
+            x1 = pre->x1[is0]; x2 = pre->x2[is0];
+            y1 = pre->y1[is0]; y2 = pre->y2[is0];
+            ff = complex<double>(pre->ffre[is0], pre->ffim[is0]);
+#ifdef FFTW
+            if (wantFFT && pre->hasFar) {
+                fpower = pre->fpower[is0];
+                fx1 = pre->fx1[is0]; fx2 = pre->fx2[is0];
+                fy1 = pre->fy1[is0]; fy2 = pre->fy2[is0];
+            }
+#endif
+        } else {
         for (int iy = 0; iy < ngrid; iy++) {
             double dy = static_cast<double>(iy) + shift;
             for (int ix = 0; ix < ngrid; ix++) {
@@ -780,13 +897,7 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         }
 
 #ifdef FFTW
-        double fpower=0;
-        double fx1=0;
-        double fx2=0;
-        double fy1=0;
-        double fy2=0;
-
-        if (filter["fft"]){
+        if (wantFFT){
             fftw_execute(p);
             for (int iy=0;iy<ngrid;iy++){
                 double dy=static_cast<double>(iy)+shift;
@@ -806,6 +917,7 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
             }
         }
 #endif
+        }
 
         if (global) {
             g_pow += power;
@@ -853,7 +965,8 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
         // of the grid, where the field is orders of magnitude smaller than on
         // axis. This form is identical for odd ngrid and correct for even.
         int i=(ngrid/2)*ngrid+(ngrid/2);
-        loc=slice.at(i);
+        loc = (pre != nullptr) ? complex<double>(pre->midre[is0], pre->midim[is0])
+                               : slice.at(i);
         double inten=loc.real()*loc.real()+loc.imag()*loc.imag();
         double intenphi=atan2(loc.imag(),loc.real());
         double farfield=ff.real()*ff.real()+ff.imag()*ff.imag();
@@ -876,25 +989,25 @@ void DiagField::getValues(Field *field,std::map<std::string,std::vector<double> 
 
         // save the data into the provided arrays
         int idx = iz*ns+is;         // index for saving the data
-        this->storeValue(val,"power",idx,power);
-        if (filter["spatial"]){
-            this->storeValue(val,"xposition",idx,x1);
-            this->storeValue(val,"xsize",idx,x2);
-            this->storeValue(val,"yposition",idx,y1);
-            this->storeValue(val,"ysize",idx,y2);
+        putValue(v_power, idx, power);
+        if (wantSpatial){
+            putValue(v_xposition, idx, x1);
+            putValue(v_xsize, idx, x2);
+            putValue(v_yposition, idx, y1);
+            putValue(v_ysize, idx, y2);
         }
-        if (filter["intensity"]){
-            this->storeValue(val,"intensity-nearfield",idx,inten);
-            this->storeValue(val,"phase-nearfield",idx,intenphi);
-            this->storeValue(val,"intensity-farfield",idx,farfield);
-            this->storeValue(val,"phase-farfield",idx,farfieldphi);
+        if (wantIntensity){
+            putValue(v_intenNear, idx, inten);
+            putValue(v_phaseNear, idx, intenphi);
+            putValue(v_intenFar, idx, farfield);
+            putValue(v_phaseFar, idx, farfieldphi);
         }
 #ifdef FFTW
-        if (filter["fft"]){
-            this->storeValue(val,"xpointing",idx,fx1);
-            this->storeValue(val,"xdivergence",idx,fx2);
-            this->storeValue(val,"ypointing",idx,fy1);
-            this->storeValue(val,"ydivergence",idx,fy2);
+        if (wantFFT){
+            putValue(v_xpointing, idx, fx1);
+            putValue(v_xdivergence, idx, fx2);
+            putValue(v_ypointing, idx, fy1);
+            putValue(v_ydivergence, idx, fy2);
         }
 #endif
         // increase the slice counter

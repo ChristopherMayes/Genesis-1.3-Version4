@@ -106,20 +106,35 @@ void Collective::initWake(unsigned int ns_in, unsigned int nsNode, double ds_in,
 
  
 
-void Collective::apply(Beam *beam, Undulator *und, double delz)
+// Fills beam->eloss with the per-slice energy loss in eV/m, refreshing the
+// internal wake first if that is required. The particles are left untouched, so
+// that a backend which holds them elsewhere can apply the same loss itself.
+// Returns false if no wake is defined, in which case eloss is not written.
+bool Collective::computeLoss(Beam *beam, Undulator *und)
 {
-
   if (!hasWake){
-    return;
+    return false;
   }
 
   if (needsUpdate || transient) { this->update(beam, und->getz()); }
 
+  for (int ic = 0; ic <beam->current.size(); ic++){
+    beam->eloss[ic]=wakeext.at(ic)+wakeint.at(ic);
+  }
+  return true;
+}
+
+
+void Collective::apply(Beam *beam, Undulator *und, double delz)
+{
+
+  if (!this->computeLoss(beam, und)){
+    return;
+  }
 
   // apply wakes
 
   for (int ic = 0; ic <beam->current.size(); ic++){
-    beam->eloss[ic]=wakeext.at(ic)+wakeint.at(ic);
     double dg=beam->eloss[ic]*delz/eev;    // actual beam loss per integration step
     unsigned long npart=beam->beam.at(ic).size();
     for (unsigned long ip=0; ip<npart; ip++){

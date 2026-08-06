@@ -8,5 +8,7 @@
 
 [Output Files](#main-output-file)
 
+[GPU Acceleration](#gpu-acceleration)
+
 <div style="page-break-after: always; visibility: hidden"> \pagebreak </div>
 
