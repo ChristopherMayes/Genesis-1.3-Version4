@@ -34,16 +34,47 @@ list(APPEND CMAKE_PREFIX_PATH $ENV{FFTW_ROOT})
 # container for needed librarires
 list(APPEND _libraries)
 
-# Check for macOS with MacPorts
-if(EXISTS "/opt/local/bin/h5pcc")
-  set(CMAKE_CXX_COMPILER /opt/local/bin/h5pcc)
+# MacPorts installs a parallel HDF5 whose compiler wrapper supplies HDF5 and MPI
+# itself, which makes it the easiest way to build on a Mac that has MacPorts and
+# nothing else. It is only the easiest way when it is the whole toolchain. This
+# runs after project(), so CMake has already detected a C and a C++ compiler and
+# derived every flag from them; replacing just the C++ one leaves the C compiler
+# and the flags belonging to somewhere else, and the link then goes out against
+# two HDF5 and MPI installations at once. What that looks like is a page of
+# undefined _ompi_mpi_* symbols after everything has compiled, which says nothing
+# about its cause.
+#
+# It therefore stays the default where it is present, since that is what a
+# MacPorts-only machine wants, but it can be switched off, and it says both that
+# it happened and how to decline it.
+option(USE_MACPORTS_H5PCC
+       "On macOS, use MacPorts' h5pcc wrapper as the C++ compiler when present" ON)
+set(MACPORTS_H5PCC "/opt/local/bin/h5pcc" CACHE FILEPATH
+    "Path to the MacPorts HDF5 compiler wrapper")
+
+if(USE_MACPORTS_H5PCC AND EXISTS "${MACPORTS_H5PCC}")
+  set(CMAKE_CXX_COMPILER "${MACPORTS_H5PCC}")
+  message(STATUS "Using ${MACPORTS_H5PCC} as the C++ compiler "
+                 "(-DUSE_MACPORTS_H5PCC=OFF to use your own)")
+
+  # The mix is worth naming before it becomes a link error rather than after.
+  get_filename_component(_h5pcc_dir "${MACPORTS_H5PCC}" DIRECTORY)
+  get_filename_component(_cc_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+  if(NOT _cc_dir STREQUAL _h5pcc_dir)
+    message(WARNING
+      "The C++ compiler is now ${MACPORTS_H5PCC} but the C compiler is still "
+      "${CMAKE_C_COMPILER}, so this build mixes two toolchains and will link "
+      "against two HDF5 and MPI installations. If you meant to build with a "
+      "conda environment or any other self-contained toolchain, configure with "
+      "-DUSE_MACPORTS_H5PCC=OFF.")
+  endif()
 endif()
 
 
 if (CMAKE_CXX_COMPILER MATCHES  "h5pcc")
    Message(STATUS "h5pcc compiler wrapper found - No additional libraries needed")
 else()
-   Message(STATUS "h5pcc not found - looking for basic compiler")
+   Message(STATUS "No h5pcc wrapper in use - looking for compiler, MPI and HDF5")
    Message(STATUS "C++ Compiler: ${CMAKE_CXX_COMPILER}")
    Message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
 

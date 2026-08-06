@@ -434,8 +434,17 @@ from the fourth entry down.
   provider busy-polls and costs **5.9× at 8 ranks** (96.0 s → 16.3 s). Worth a manual note.
 - `ngrid = 255 = 3 × 5 × 17` is a pathological FFT length: 59.7 s vs 38.3 s at 256 on the same
   case. Worth a manual note or a warning at startup.
-- `CMakeLists.txt` forces `/opt/local/bin/h5pcc` as the C++ compiler if that file exists,
-  silently overriding `CMAKE_CXX_COMPILER`. Surprising on any machine with MacPorts.
+- **`CMakeLists.txt` forced `/opt/local/bin/h5pcc` as the C++ compiler whenever that file
+  existed**, silently overriding `CMAKE_CXX_COMPILER`, and no command-line argument could
+  defeat it because it was a plain `set()`. Recorded here as a reading of the code until it
+  bit a real user: a Mac Studio with MacPorts installed, following the GPU.md instructions
+  with a conda toolchain, compiled everything and then failed to link with a page of
+  undefined `_ompi_mpi_*` symbols. The override runs after `project()`, so CMake had already
+  detected conda's clang and derived every flag from it; swapping only the C++ compiler left
+  the C compiler and the flags conda's and pulled MacPorts' static parallel HDF5 into a link
+  that had no MPI library in it. Now an option, `USE_MACPORTS_H5PCC`, still defaulting on so
+  that a MacPorts-only machine is unaffected, and it warns at configure time when the two
+  compilers come from different places, which is the whole of the diagnosis.
 - If FFTW is not found, `FieldSolverFFT` silently produces wrong results rather than failing
   the build — the `fftw_execute` calls are inside `#ifdef FFTW` but the surrounding copy loops
   are not.
